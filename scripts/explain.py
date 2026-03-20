@@ -27,9 +27,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shap
-import lime
-import lime.lime_tabular
 import xgboost as xgb
+try:
+    import lime
+    import lime.lime_tabular
+    LIME_AVAILABLE = True
+except ImportError:
+    LIME_AVAILABLE = False
+    print("  [info] lime not installed — LIME explanations will be skipped.")
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -285,7 +290,10 @@ def _run_task(task, target, is_clf):
     model, sc, Xtr, Xte, ytr, yte = _train_full(X, y, is_clf)
 
     feat_rank, group_rank = _shap_analysis(model, Xtr, Xte, groups, task, is_clf)
-    _lime_analysis(model, sc, Xtr, Xte, yte, task, is_clf)
+    if LIME_AVAILABLE:
+        _lime_analysis(model, sc, Xtr, Xte, yte, task, is_clf)
+    else:
+        print("  LIME skipped (not installed).")
     _save_rankings(feat_rank, group_rank, task)
 
 
