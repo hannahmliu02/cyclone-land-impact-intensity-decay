@@ -1,12 +1,10 @@
 """
-Download TCND Data_1d basin files (WP, NA, EP) from Google Drive.
+Download all three TCND pillars (Data_1d, Data_3d, Env-Data) for WP, NA, EP.
 
-The TCND dataset is structured into three pillars:
-  - Data_1d : IBTrACS tabular records (Location, Pressure, Wind) — used here
-  - Data_3d : 20°x20° gridded spatial patches at 0.25°, 6-hour intervals
-  - Env-Data: Pre-calculated physical shortcuts and historical momentum
-
-We only download Data_1d for the WP, NA, and EP basins.
+TCND dataset structure:
+  Data_1d/  — IBTrACS tabular records (Location, Pressure, Wind)
+  Data_3d/  — 20°x20° gridded spatial patches @ 0.25°, 6-hour intervals
+  Env-Data/ — Pre-calculated physical shortcuts and historical momentum
 
 Usage:
     pip install -r requirements.txt
@@ -19,14 +17,10 @@ import zipfile
 
 import gdown
 
-# Root Google Drive folder shared by the dataset
 FOLDER_URL = "https://drive.google.com/drive/folders/1CIVnMCakIoDF7_2xEMWsclKRz8ICAnXq"
 
-# Data_1d subfolder — tabular IBTrACS records
-DATA_1D_SUBFOLDER = "Data_1d"
-
-# Only these three basins are needed
-TARGET_BASINS = ["WP", "NA", "EP"]
+TARGET_BASINS   = ["WP", "NA", "EP"]
+TARGET_PILLARS  = ["Data_1d", "Data_3d", "Env-Data"]
 
 RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 TMP_DIR = os.path.join(RAW_DIR, "_tmp")
@@ -34,37 +28,47 @@ TMP_DIR = os.path.join(RAW_DIR, "_tmp")
 
 def download():
     os.makedirs(TMP_DIR, exist_ok=True)
-    print(f"Downloading TCND folder from Google Drive...")
-    print(f"URL: {FOLDER_URL}\n")
-
+    print(f"Downloading TCND from Google Drive...\n{FOLDER_URL}\n")
     gdown.download_folder(FOLDER_URL, output=TMP_DIR, quiet=False, remaining_ok=True)
 
 
-def extract_basins():
-    """Walk the downloaded folder, find Data_1d basin zips, extract WP/NA/EP only."""
-    moved = []
-
-    for root, dirs, files in os.walk(TMP_DIR):
-        # Only look inside Data_1d subfolder
-        if DATA_1D_SUBFOLDER not in root:
+def extract():
+    """
+    Walk tmp download, find files matching target pillars and basins,
+    extract to data/raw/<pillar>/<basin>/.
+    """
+    extracted = []
+    for root, _, files in os.walk(TMP_DIR):
+        # Determine which pillar this directory belongs to
+        pillar = None
+        for p in TARGET_PILLARS:
+            if p in root:
+                pillar = p
+                break
+        if pillar is None:
             continue
+
         for fname in files:
-            basin = fname.replace(".zip", "").upper()
-            if basin in TARGET_BASINS:
-                src = os.path.join(root, fname)
-                dst_zip = os.path.join(RAW_DIR, fname)
-                dst_dir = os.path.join(RAW_DIR, basin)
+            basin = os.path.splitext(fname)[0].upper()
+            if basin not in TARGET_BASINS:
+                continue
 
-                os.replace(src, dst_zip)
-                os.makedirs(dst_dir, exist_ok=True)
-                with zipfile.ZipFile(dst_zip, "r") as z:
-                    z.extractall(dst_dir)
-                os.remove(dst_zip)
+            src     = os.path.join(root, fname)
+            out_dir = os.path.join(RAW_DIR, pillar, basin)
+            os.makedirs(out_dir, exist_ok=True)
 
-                print(f"  Extracted {fname} -> data/raw/{basin}/")
-                moved.append(dst_dir)
+            if fname.endswith(".zip"):
+                with zipfile.ZipFile(src, "r") as z:
+                    z.extractall(out_dir)
+                print(f"  Extracted  {pillar}/{fname} -> data/raw/{pillar}/{basin}/")
+            else:
+                dst = os.path.join(out_dir, fname)
+                shutil.copy2(src, dst)
+                print(f"  Copied     {pillar}/{fname} -> data/raw/{pillar}/{basin}/")
 
-    return moved
+            extracted.append(out_dir)
+
+    return extracted
 
 
 def cleanup():
@@ -73,11 +77,11 @@ def cleanup():
 
 if __name__ == "__main__":
     download()
-    results = extract_basins()
+    results = extract()
     cleanup()
 
     if not results:
-        print("\nNo WP/NA/EP files found in Data_1d. Check the folder structure.")
+        print("\nNo matching files found. Verify the Drive folder structure.")
     else:
-        print(f"\nDone. {len(results)} basin(s) ready in data/raw/")
-        print("Next step: python scripts/analyze.py")
+        print(f"\nDone — {len(results)} dataset(s) ready.")
+        print("Next step: python scripts/train.py")
