@@ -1,0 +1,18 @@
+# Raw data files — download locally using scripts/download_data.py
+data/raw/
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
