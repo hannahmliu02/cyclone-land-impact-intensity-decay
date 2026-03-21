@@ -72,6 +72,7 @@ DEVICE = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("mps") if torch.backends.mps.is_available()
           else torch.device("cpu"))
 
+<<<<<<< HEAD
 # ── Feature columns — loaded dynamically from ablation output ─────────────────
 _FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
 
@@ -136,6 +137,18 @@ def _load_tab_cols(task: str) -> list:
 
 
 TAB_COLS    = _load_tab_cols("decay")   # overridden per-task in load_data()
+=======
+# ── Feature columns — top groups from ablation study ──────────────────────────
+# Ablation results: wp_couple (R²=0.272) > wind (0.269) > pressure (0.260)
+# Position and land_sea hurt performance (negative R² when used alone)
+TAB_COLS = [
+    "wind_last", "wind_max", "wind_mean", "wind_std",
+    "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
+    "pres_last", "pres_min", "pres_mean", "pres_std",
+    "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
+    "wp_residual",
+]
+>>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
 TARGET_COLS = ["wind_24h", "wind_48h"]
 LANDFALL_TARGET = "hours_to_landfall"
 
@@ -297,6 +310,7 @@ def _collate_spatial(batch):
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
+<<<<<<< HEAD
 def _split_df(df, seed):
     """Apply TCND original splits if available, else random 70/15/15."""
     if "split" in df.columns and df["split"].isin(["train","val","test"]).any():
@@ -305,6 +319,22 @@ def _split_df(df, seed):
         test_df  = df[df["split"] == "test"].reset_index(drop=True)
         print(f"Split      : TCND original  "
               f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
+=======
+def load_data(seed: int):
+    """Return (train_loader, val_loader, test_loader, meta, mode, tab_dim)."""
+    samples_csv = os.path.join(PROC_DIR, "samples.csv")
+    decay_csv   = os.path.join(FEAT_DIR,  "feature_matrix_decay.csv")
+
+    # Prefer processed tensors; fall back to feature matrix
+    if os.path.exists(samples_csv):
+        mode = "spatial"
+        df   = pd.read_csv(samples_csv, keep_default_na=False)
+        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
+    elif os.path.exists(decay_csv):
+        mode = "tabular"
+        df   = pd.read_csv(decay_csv, keep_default_na=False)
+        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
+>>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
     else:
         train_df, tmp_df = train_test_split(df, test_size=0.3, random_state=seed)
         val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)

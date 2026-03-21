@@ -502,8 +502,12 @@ def main():
         print("feature_matrix_decay.csv not found. Run features.py first.")
         sys.exit(1)
 
+<<<<<<< HEAD
     df = pd.read_csv(decay_csv, keep_default_na=False).dropna(
         subset=TARGET_COLS).reset_index(drop=True)
+=======
+    df = pd.read_csv(decay_csv, keep_default_na=False).dropna(subset=TARGET_COLS).reset_index(drop=True)
+>>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
     print(f"Evaluating on {len(df)} samples …")
 
     df = predict(model, df, meta,
