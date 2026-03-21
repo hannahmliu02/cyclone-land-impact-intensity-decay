@@ -1,0 +1,41 @@
+{
+  "id": "exp_001",
+  "name": "Baseline UFNO — all basins, no regularisation",
+  "date": "2026-03-21",
+  "script": "scripts/train_ufno.py",
+  "description": "First full training run on real TCND data (WP+NA+EP). No dropout, StepLR scheduler, low weight decay.",
+  "hyperparameters": {
+    "epochs": 100,
+    "batch": 8,
+    "lr": 0.001,
+    "modes": 12,
+    "width": 32,
+    "unet_dropout": 0.0,
+    "weight_decay": 0.0001,
+    "scheduler": "StepLR(step_size=10, gamma=0.9)"
+  },
+  "data": {
+    "basins": ["WP", "NA", "EP"],
+    "split": "TCND original",
+    "n_train": 651,
+    "n_val": 188,
+    "n_test": 94,
+    "tab_cols": 17,
+    "feature_groups": ["wp_couple", "wind", "pressure"]
+  },
+  "results": {
+    "best_val_loss": 0.8804,
+    "best_epoch": 15,
+    "final_train_loss": 0.7874,
+    "final_val_loss": 0.9933,
+    "rmse_24h": 0.594,
+    "rmse_48h": 0.753,
+    "per_basin": {
+      "NA": {"n": 214, "rmse_24h": 0.081, "rmse_48h": 0.177},
+      "WP": {"n": 605, "rmse_24h": 0.128, "rmse_48h": 0.273},
+      "EP": {"n": 114, "rmse_24h": 1.669, "rmse_48h": 2.047}
+    }
+  },
+  "observations": "Clear overfitting — val loss diverges from train after epoch 15. EP RMSE extremely high, likely due to class imbalance (114 storms vs 605 WP). Val loss best at epoch 15 but never recovers after.",
+  "checkpoint": "models/best_ufno.pt (overwritten)"
+}

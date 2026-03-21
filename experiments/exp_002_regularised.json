@@ -1,0 +1,41 @@
+{
+  "id": "exp_002",
+  "name": "Regularised UFNO — dropout + plateau LR + basin sampler",
+  "date": "2026-03-21",
+  "script": "scripts/train_ufno.py",
+  "description": "Added Dropout(0.3) to prediction head, unet_dropout=0.2, weight_decay increased to 1e-3, StepLR replaced with ReduceLROnPlateau(patience=10), and inverse-frequency WeightedRandomSampler to oversample EP.",
+  "hyperparameters": {
+    "epochs": 150,
+    "batch": 8,
+    "lr": 0.001,
+    "modes": 12,
+    "width": 32,
+    "unet_dropout": 0.2,
+    "head_dropout": 0.3,
+    "weight_decay": 0.001,
+    "scheduler": "ReduceLROnPlateau(factor=0.5, patience=10, min_lr=1e-5)",
+    "sampler": "WeightedRandomSampler (inverse basin frequency)"
+  },
+  "data": {
+    "basins": ["WP", "NA", "EP"],
+    "split": "TCND original",
+    "n_train": 651,
+    "n_val": 188,
+    "n_test": 94,
+    "tab_cols": 17,
+    "feature_groups": ["wp_couple", "wind", "pressure"]
+  },
+  "results": {
+    "best_val_loss": 0.8871,
+    "best_epoch": 5,
+    "final_train_loss": 0.8051,
+    "final_val_loss": 0.9292,
+    "per_basin": {
+      "NA": {"n": 214, "rmse_24h": 0.086, "rmse_48h": 0.186, "bias_24h": -0.019, "bias_48h": -0.044},
+      "WP": {"n": 605, "rmse_24h": 0.129, "rmse_48h": 0.277, "bias_24h": 0.039, "bias_48h": 0.071},
+      "EP": {"n": 114, "rmse_24h": 0.131, "rmse_48h": 0.316, "bias_24h": 0.007, "bias_48h": 0.062}
+    }
+  },
+  "observations": "Regularisation significantly reduced EP RMSE (1.669 → 0.131 at 24h). Train/val gap narrowed. Best val at epoch 5 — model still learns quickly and plateaus. Val loss flatlines ~0.93 for remaining 145 epochs suggesting model capacity or data size is now the bottleneck, not regularisation.",
+  "checkpoint": "models/best_ufno.pt (current)"
+}
