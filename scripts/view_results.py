@@ -85,7 +85,6 @@ def load_model(ckpt_path: str):
         modes2       = args.get("modes", 12),
         width        = args.get("width", 32),
         unet_dropout = args.get("unet_dropout", 0.0),
-        n_outputs    = n_outputs,
     ).to(DEVICE)
     model.load_state_dict(ckpt["state"])
     model.eval()
@@ -96,13 +95,12 @@ def load_model(ckpt_path: str):
 def predict(model, df: pd.DataFrame, meta: dict,
             tgt_mean, tgt_scale, tab_mean=None, tab_scale=None) -> pd.DataFrame:
     """Returns df with added columns: pred_24h, pred_48h, err_24h, err_48h."""
-    tab_cols = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
-    X_raw = df[tab_cols].values.astype(np.float32)
-    if tab_mean is not None and tab_scale is not None:
-        X_tab = (X_raw - np.array(tab_mean)) / np.array(tab_scale)
-    else:
-        tab_scaler = StandardScaler()
-        X_tab = tab_scaler.fit_transform(X_raw)
+    tab_cols  = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
+    tab_scaler = StandardScaler()
+
+    # Fit scaler on full df (viewer uses all available data for display)
+    X_tab = tab_scaler.fit_transform(
+        df[tab_cols].values.astype(np.float32))
 
     preds = []
     with torch.no_grad():
@@ -502,12 +500,7 @@ def main():
         print("feature_matrix_decay.csv not found. Run features.py first.")
         sys.exit(1)
 
-<<<<<<< HEAD
-    df = pd.read_csv(decay_csv, keep_default_na=False).dropna(
-        subset=TARGET_COLS).reset_index(drop=True)
-=======
     df = pd.read_csv(decay_csv, keep_default_na=False).dropna(subset=TARGET_COLS).reset_index(drop=True)
->>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
     print(f"Evaluating on {len(df)} samples …")
 
     df = predict(model, df, meta,

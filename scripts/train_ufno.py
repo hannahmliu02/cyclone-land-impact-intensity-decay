@@ -567,7 +567,7 @@ def main():
         modes1       = args.modes,
         modes2       = args.modes,
         width        = args.width,
-        unet_dropout = 0.2,
+        unet_dropout = args.unet_dropout,
     ).to(DEVICE)
 
     print(f"\nTask       : {task}")
