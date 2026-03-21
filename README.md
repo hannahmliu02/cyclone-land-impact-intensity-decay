@@ -91,28 +91,6 @@ Running `ablation.py` automatically updates `data/features/selected_feature_grou
 
 ---
 
-## Training Results
-
-Trained for **100 epochs** on the TCND original train split, evaluated on val split.
-
-| Metric | Value |
-|---|---|
-| Best val loss (LpLoss) | 0.8804 (epoch 15) |
-| Best val MAE | 0.5897 |
-| Final train loss | 0.7874 |
-
-**Per-basin RMSE on test set (normalised units):**
-
-| Basin | Storms | RMSE 24h | RMSE 48h |
-|---|---|---|---|
-| NA | 214 | 0.081 | 0.177 |
-| WP | 605 | 0.128 | 0.273 |
-| EP | 114 | 1.669 | 2.047 |
-
-EP shows higher error — likely due to fewer training samples (114 vs 605 for WP).
-
----
-
 ## Usage
 
 ### 1. Build features
