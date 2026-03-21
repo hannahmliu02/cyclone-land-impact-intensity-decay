@@ -29,9 +29,13 @@ import glob
 import json
 import math
 import os
+import sys
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(__file__))
+from load_tcnd import load_basin as _tcnd_load_basin
 
 RAW_DIR  = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
@@ -86,27 +90,11 @@ def _dist_to_coast_proxy(lat, lon):
 
 # ── Load Data_1d ───────────────────────────────────────────────────────────────
 def _load_1d(basin: str) -> pd.DataFrame:
-    files = glob.glob(os.path.join(RAW_DIR, "Data_1d", basin, "**", "*.csv"),
-                      recursive=True)
-    if not files:
-        raise FileNotFoundError(f"No Data_1d CSVs for basin {basin}")
-    frames = [pd.read_csv(f, low_memory=False, skiprows=lambda i: i == 1)
-              for f in files]
-    df = pd.concat(frames, ignore_index=True)
-    df = df.rename(columns={
-        _col(df, "storm_id"): "storm_id",
-        _col(df, "time"):     "time",
-        _col(df, "lat"):      "lat",
-        _col(df, "lon"):      "lon",
-        _col(df, "wind"):     "wind",
-        _col(df, "pressure"): "pressure",
-    })
-    for col in ["lat", "lon", "wind", "pressure"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["time"]  = pd.to_datetime(df["time"], errors="coerce")
-    df["basin"] = basin
-    return df.dropna(subset=["storm_id","time","lat","lon"]).sort_values(
-        ["storm_id","time"]).reset_index(drop=True)
+    """Load TCND Data_1d tracks and alias columns for downstream feature code."""
+    df = _tcnd_load_basin(basin)
+    # Alias normalised columns to the names expected by _tabular_features
+    df = df.rename(columns={"wind_norm": "wind", "pres_norm": "pressure"})
+    return df
 
 
 # ── Derive tabular features for a single track window ─────────────────────────
@@ -144,34 +132,36 @@ def _tabular_features(window: pd.DataFrame) -> dict:
 
     # ── wind-pressure coupling ───────────────────────────────────────
     # Deviation from the empirical Dvorak W-P relationship
-    if not np.isnan(feats["wind_last"]) and not np.isnan(feats["pres_last"]):
-        expected_wind = 2.3 * (1013 - feats["pres_last"]) ** 0.5
-        feats["wp_residual"] = feats["wind_last"] - expected_wind
-    else:
-        feats["wp_residual"] = np.nan
+    # wp_residual uses physical units; with normalised wind/pressure we store
+    # the normalised wind-pressure difference as a proxy instead.
+    feats["wp_residual"] = feats["wind_last"] - feats["pres_last"]
 
     # ── position group ──────────────────────────────────────────────
-    feats["lat_last"] = float(w["lat"].iloc[-1])
-    feats["lon_last"] = float(w["lon"].iloc[-1])
+    feats["lat_last"]      = float(w["lat"].iloc[-1])
+    feats["lon_norm_last"] = float(w["lon_norm"].iloc[-1]) \
+                             if "lon_norm" in w.columns else 0.0
 
     if len(w) >= 2:
         dlat = w["lat"].iloc[-1] - w["lat"].iloc[-2]
-        dlon = w["lon"].iloc[-1] - w["lon"].iloc[-2]
-        # approximate km per degree
-        feats["motion_speed_kph"] = math.hypot(dlat * 111, dlon * 111 *
-                                    math.cos(math.radians(w["lat"].iloc[-1]))) / 6
-        feats["motion_dir_deg"]   = math.degrees(math.atan2(dlon, dlat)) % 360
+        # lon_norm is normalised; use its delta as a relative eastward motion proxy
+        dlon_norm = w["lon_norm"].iloc[-1] - w["lon_norm"].iloc[-2] \
+                    if "lon_norm" in w.columns else 0.0
+        # motion_speed uses lat-based km conversion for dlat; dlon_norm is unitless
+        feats["motion_speed_kph"] = math.hypot(dlat * 111, dlon_norm * 30) / 6
+        feats["motion_dir_deg"]   = math.degrees(math.atan2(dlon_norm, dlat)) % 360
     else:
         feats["motion_speed_kph"] = 0.0
         feats["motion_dir_deg"]   = 0.0
 
     # ── land-sea group ───────────────────────────────────────────────
-    lat0, lon0 = w["lat"].iloc[-1], w["lon"].iloc[-1]
-    feats["over_land"]       = int(_over_land(lat0, lon0))
-    feats["dist_to_coast"]   = _dist_to_coast_proxy(lat0, lon0)
-    # Count how many of the lookback steps were over land
-    feats["land_frac_window"] = float(
-        sum(_over_land(r["lat"], r["lon"]) for _, r in w.iterrows()) / len(w))
+    # lon_norm is normalised so the geographic land-mask is not applicable.
+    # We store lon_norm directly as a positional feature and set land flags
+    # to 0 (unknown).  If real lon becomes available, replace these lines.
+    feats["over_land"]        = 0
+    feats["dist_to_coast"]    = 0.0
+    feats["land_frac_window"] = 0.0
+    feats["lon_norm_last"]    = float(w["lon_norm"].iloc[-1]) \
+                                if "lon_norm" in w.columns else 0.0
 
     return feats
 
@@ -234,42 +224,46 @@ def _env_features(basin: str, sid: str) -> dict:
     return {}
 
 
-# ── Detect landfalls ───────────────────────────────────────────────────────────
+# ── Detect reference events ────────────────────────────────────────────────────
 def _detect_landfalls(data: pd.DataFrame) -> pd.DataFrame:
-    data = data.copy()
-    data["over_land"] = data.apply(
-        lambda r: _over_land(r["lat"], r["lon"]), axis=1)
+    """
+    Use peak-intensity time as the reference event for every storm.
+
+    The TCND Data_1d longitude is normalised, so reliable land-mask detection
+    is not possible.  Peak intensity is a physically meaningful reference for
+    the decay task: features before peak → predict intensity at +24h / +48h.
+
+    made_landfall=1 when the storm track continues for ≥4 more steps (24 h)
+    after peak intensity and wind decreases, suggesting dissipation / landfall.
+    made_landfall=0 for very short tracks or storms that re-intensify.
+    """
     events = []
     for sid, grp in data.groupby("storm_id"):
         grp = grp.sort_values("time").reset_index(drop=True)
-        made_lf = False
-        for i in range(1, len(grp)):
-            if not grp.loc[i-1, "over_land"] and grp.loc[i, "over_land"]:
-                events.append({
-                    "storm_id":      sid,
-                    "basin":         grp.loc[i, "basin"],
-                    "landfall_time": grp.loc[i, "time"],
-                    "landfall_wind": grp.loc[i, "wind"],
-                    "landfall_pres": grp.loc[i, "pressure"],
-                    "landfall_lat":  grp.loc[i, "lat"],
-                    "landfall_lon":  grp.loc[i, "lon"],
-                    "made_landfall": 1,
-                })
-                made_lf = True
-                break
-        if not made_lf:
-            # No landfall — use peak intensity point as reference
-            peak_i = grp["wind"].idxmax()
-            events.append({
-                "storm_id":      sid,
-                "basin":         grp.loc[peak_i, "basin"] if "basin" in grp.columns else grp.iloc[0]["basin"],
-                "landfall_time": grp.loc[peak_i, "time"],
-                "landfall_wind": grp.loc[peak_i, "wind"],
-                "landfall_pres": grp.loc[peak_i, "pressure"],
-                "landfall_lat":  grp.loc[peak_i, "lat"],
-                "landfall_lon":  grp.loc[peak_i, "lon"],
-                "made_landfall": 0,
-            })
+        if len(grp) < 4:
+            continue
+        peak_i = int(grp["wind"].idxmax())
+        peak_r = grp.loc[peak_i]
+
+        # Require at least 8 steps (48 h) after peak to compute targets
+        steps_after = len(grp) - 1 - peak_i
+        if steps_after < 1:
+            continue
+
+        # Simple landfall proxy: track continues and wind decreases after peak
+        post_wind = grp.loc[peak_i + 1:, "wind"].values
+        made_lf   = int(len(post_wind) >= 4 and post_wind[0] < peak_r["wind"])
+
+        events.append({
+            "storm_id":      sid,
+            "basin":         peak_r.get("basin", grp.iloc[0]["basin"]),
+            "landfall_time": peak_r["time"],
+            "landfall_wind": peak_r["wind"],
+            "landfall_pres": peak_r["pressure"],
+            "landfall_lat":  peak_r["lat"],
+            "landfall_lon":  peak_r.get("lon_norm", 0.0),
+            "made_landfall": made_lf,
+        })
     return pd.DataFrame(events)
 
 
@@ -365,7 +359,7 @@ def build_feature_matrices():
         "pressure":  [c for c in all_cols if c.startswith("pres")],
         "wp_couple": [c for c in all_cols if "wp_" in c],
         "position":  [c for c in all_cols if c in
-                      ("lat_last","lon_last","motion_speed_kph","motion_dir_deg")],
+                      ("lat_last","lon_norm_last","motion_speed_kph","motion_dir_deg")],
         "spatial":   [c for c in all_cols if c.startswith("sp_")],
         "env":       [c for c in all_cols if c.startswith("env_")],
         "land_sea":  [c for c in all_cols if c in

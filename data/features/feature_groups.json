@@ -1,0 +1,38 @@
+{
+  "wind": [
+    "wind_last",
+    "wind_max",
+    "wind_mean",
+    "wind_std",
+    "wind_delta_6h",
+    "wind_delta_12h",
+    "wind_delta_24h",
+    "wind_trend"
+  ],
+  "pressure": [
+    "pres_last",
+    "pres_min",
+    "pres_mean",
+    "pres_std",
+    "pres_delta_6h",
+    "pres_delta_12h",
+    "pres_delta_24h",
+    "pres_trend"
+  ],
+  "wp_couple": [
+    "wp_residual"
+  ],
+  "position": [
+    "lat_last",
+    "lon_norm_last",
+    "motion_speed_kph",
+    "motion_dir_deg"
+  ],
+  "spatial": [],
+  "env": [],
+  "land_sea": [
+    "over_land",
+    "dist_to_coast",
+    "land_frac_window"
+  ]
+}
