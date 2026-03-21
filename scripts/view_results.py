@@ -221,7 +221,7 @@ def plot_spatial_errors(df: pd.DataFrame, ax):
 
 def plot_basin_summary(df: pd.DataFrame, ax):
     """Per-basin RMSE bar chart for 24h and 48h horizons."""
-    basins = sorted(df["basin"].unique())
+    basins = sorted(df["basin"].dropna().unique())
     x = np.arange(len(basins))
     w = 0.35
 
@@ -336,7 +336,7 @@ def main():
         print("feature_matrix_decay.csv not found. Run features.py first.")
         sys.exit(1)
 
-    df = pd.read_csv(decay_csv).dropna(subset=TARGET_COLS).reset_index(drop=True)
+    df = pd.read_csv(decay_csv, keep_default_na=False).dropna(subset=TARGET_COLS).reset_index(drop=True)
     print(f"Evaluating on {len(df)} samples …")
 
     df = predict(model, df, meta,

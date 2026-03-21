@@ -53,16 +53,15 @@ DEVICE = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("mps") if torch.backends.mps.is_available()
           else torch.device("cpu"))
 
-# ── Feature columns used in tabular-only mode ─────────────────────────────────
-# Matches the groups produced by features.py (wind + pressure + wp + position + land_sea)
+# ── Feature columns — top groups from ablation study ──────────────────────────
+# Ablation results: wp_couple (R²=0.272) > wind (0.269) > pressure (0.260)
+# Position and land_sea hurt performance (negative R² when used alone)
 TAB_COLS = [
     "wind_last", "wind_max", "wind_mean", "wind_std",
     "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
     "pres_last", "pres_min", "pres_mean", "pres_std",
     "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
     "wp_residual",
-    "lat_last", "lon_last", "motion_speed_kph", "motion_dir_deg",
-    "over_land", "dist_to_coast", "land_frac_window",
 ]
 TARGET_COLS = ["wind_24h", "wind_48h"]
 
@@ -153,11 +152,11 @@ def load_data(seed: int):
     # Prefer processed tensors; fall back to feature matrix
     if os.path.exists(samples_csv):
         mode = "spatial"
-        df   = pd.read_csv(samples_csv)
+        df   = pd.read_csv(samples_csv, keep_default_na=False)
         df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
     elif os.path.exists(decay_csv):
         mode = "tabular"
-        df   = pd.read_csv(decay_csv)
+        df   = pd.read_csv(decay_csv, keep_default_na=False)
         df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
     else:
         raise FileNotFoundError(

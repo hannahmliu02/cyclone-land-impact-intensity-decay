@@ -62,7 +62,7 @@ def _load(task):
     p = os.path.join(FEAT_DIR, f"feature_matrix_{task}.csv")
     if not os.path.exists(p):
         raise FileNotFoundError(f"Run features.py first — {p} not found.")
-    return pd.read_csv(p)
+    return pd.read_csv(p, keep_default_na=False)
 
 def _load_groups():
     with open(os.path.join(FEAT_DIR, "feature_groups.json")) as f:
