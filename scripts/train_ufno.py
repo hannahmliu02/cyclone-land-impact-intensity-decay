@@ -341,6 +341,8 @@ def main():
     parser.add_argument("--lr",     type=float, default=1e-3)
     parser.add_argument("--modes",  type=int,   default=12)
     parser.add_argument("--width",  type=int,   default=32)
+    parser.add_argument("--unet-dropout", type=float, default=0.2,
+                        help="Dropout rate inside UNet2d branches")
     parser.add_argument("--no-tab", action="store_true",
                         help="Disable tabular FiLM conditioning")
     parser.add_argument("--seed",   type=int,   default=42)
@@ -361,7 +363,7 @@ def main():
         modes1       = args.modes,
         modes2       = args.modes,
         width        = args.width,
-        unet_dropout = 0.2,
+        unet_dropout = args.unet_dropout,
     ).to(DEVICE)
 
     print(f"\nModel      : CycloneUFNO  ({model.count_params():,} params)")

@@ -84,6 +84,7 @@ def load_model(ckpt_path: str):
         modes1       = args.get("modes", 12),
         modes2       = args.get("modes", 12),
         width        = args.get("width", 32),
+        unet_dropout = args.get("unet_dropout", 0.0),
     ).to(DEVICE)
     model.load_state_dict(ckpt["state"])
     model.eval()
@@ -94,7 +95,7 @@ def load_model(ckpt_path: str):
 def predict(model, df: pd.DataFrame, meta: dict,
             tgt_mean, tgt_scale) -> pd.DataFrame:
     """Returns df with added columns: pred_24h, pred_48h, err_24h, err_48h."""
-    tab_cols  = [c for c in TAB_COLS if c in df.columns]
+    tab_cols  = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
     tab_scaler = StandardScaler()
 
     # Fit scaler on full df (viewer uses all available data for display)
