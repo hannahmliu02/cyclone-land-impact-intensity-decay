@@ -2,8 +2,7 @@
   "selected_groups": [
     "wp_couple",
     "wind",
-    "pressure",
-    "spatial"
+    "pressure"
   ],
   "ranked_by": "r2_mean_decay_24h"
 }
