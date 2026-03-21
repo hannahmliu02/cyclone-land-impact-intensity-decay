@@ -48,6 +48,10 @@ scripts/explain.py        # SHAP + LIME feature importance (optional)
 scripts/train_ufno.py     # Train CycloneUFNO; reads TAB_COLS from ablation output
        ↓
 scripts/view_results.py   # 8-panel results dashboard
+       ↓
+scripts/log_experiment.py # Log results to experiments/
+
+scripts/cross_basin.py    # Cross-basin generalization experiments (independent)
 ```
 
 ---
@@ -115,8 +119,9 @@ Options:
 --lr       float  Initial learning rate      (default 1e-3)
 --modes    int    Fourier modes              (default 12)
 --width    int    UFNO hidden width          (default 32)
---no-tab         Disable tabular FiLM conditioning
---seed     int    Random seed                (default 42)
+--unet-dropout float  Dropout in UNet branches    (default 0.2)
+--no-tab              Disable tabular FiLM conditioning
+--seed         int    Random seed                (default 42)
 ```
 
 ### 4. View results
@@ -130,6 +135,24 @@ Saves an 8-panel dashboard to `figures/ufno_results/dashboard.png`.
 python scripts/explain.py
 ```
 Produces SHAP beeswarm/bar plots and LIME local explanations in `figures/`.
+
+### 6. Log the experiment
+```bash
+python scripts/log_experiment.py \
+  --name "Short description" \
+  --notes "What you observed"
+```
+Auto-reads the checkpoint, training history, and predictions. Saves a numbered record to `experiments/`.
+
+### 7. Cross-basin generalization (optional)
+```bash
+python scripts/cross_basin.py --epochs 60
+```
+Trains separate models per basin and tests transfer. Produces:
+- `data/features/cross_basin_results.csv`
+- `figures/cross_basin_heatmap.png` — transfer RMSE matrix
+- `figures/cross_basin_gradual.png` — effect of adding more basins
+- `figures/cross_basin_summary.png` — in-domain vs transfer vs all-basin
 
 ---
 
@@ -149,6 +172,11 @@ Produces SHAP beeswarm/bar plots and LIME local explanations in `figures/`.
 | `models/ufno_history.json` | Per-epoch loss and MAE log |
 | `figures/ufno_results/dashboard.png` | 8-panel results dashboard |
 | `figures/ufno_results/predictions.csv` | Test-set predictions with errors |
+| `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
+| `figures/cross_basin_heatmap.png` | Transfer RMSE heatmap |
+| `figures/cross_basin_gradual.png` | Gradual basin addition curves |
+| `figures/cross_basin_summary.png` | In-domain vs transfer vs all-basin comparison |
+| `experiments/exp_NNN_*.json` | Per-experiment logs (hyperparams, metrics, notes) |
 
 ---
 
