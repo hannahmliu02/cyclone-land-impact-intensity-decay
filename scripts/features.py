@@ -297,9 +297,15 @@ def build_feature_matrices():
             sp   = _spatial_features(basin, sid)
             env  = _env_features(basin, sid)
 
+            # Retrieve the TCND split (train/val/test) for this storm
+            storm_rows = data[data["storm_id"] == sid]
+            tcnd_split = storm_rows["split"].iloc[0] \
+                         if "split" in storm_rows.columns else "train"
+
             base = {
                 "storm_id":      sid,
                 "basin":         basin,
+                "split":         tcnd_split,
                 "ref_time":      t0,
                 "made_landfall": ev["made_landfall"],
             }
