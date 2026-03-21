@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 # Allow importing from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
@@ -229,10 +229,17 @@ def load_data(seed: int):
     val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False)
     test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False)
 
+    # Basin-weighted sampler: inverse-frequency weighting so EP is oversampled
+    basin_counts = train_df["basin"].value_counts().to_dict()
+    sample_weights = train_df["basin"].map(
+        lambda b: 1.0 / basin_counts.get(b, 1)).values
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
     kw = dict(batch_size=8, num_workers=0, collate_fn=collate)
-    train_loader = DataLoader(train_ds, shuffle=True,  **kw)
-    val_loader   = DataLoader(val_ds,   shuffle=False, **kw)
-    test_loader  = DataLoader(test_ds,  shuffle=False, **kw)
+    train_loader = DataLoader(train_ds, sampler=sampler, **kw)
+    val_loader   = DataLoader(val_ds,   shuffle=False,   **kw)
+    test_loader  = DataLoader(test_ds,  shuffle=False,   **kw)
 
     tab_cols = [c for c in TAB_COLS if c in df.columns]
     meta = {
@@ -354,6 +361,7 @@ def main():
         modes1       = args.modes,
         modes2       = args.modes,
         width        = args.width,
+        unet_dropout = 0.2,
     ).to(DEVICE)
 
     print(f"\nModel      : CycloneUFNO  ({model.count_params():,} params)")
@@ -362,9 +370,9 @@ def main():
 
     criterion = LpLoss(p=2)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
-                                 weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=10, gamma=0.9)
+                                 weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-5)
 
     history = {"train_loss": [], "val_loss": [],
                "train_mae": [],  "val_mae": []}
@@ -386,7 +394,7 @@ def main():
         vl_loss, vl_mae = run_epoch(
             model, val_loader, mode, DEVICE,
             desc=f"Ep {epoch:>3} val  ", show_bar=True)
-        scheduler.step()
+        scheduler.step(vl_loss)
 
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(vl_loss)

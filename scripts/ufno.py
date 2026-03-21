@@ -299,6 +299,7 @@ class CycloneUFNO(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(width, 128),
             nn.GELU(),
+            nn.Dropout(p=0.3),
             nn.Linear(128, 2),   # [wind_24h, wind_48h]
         )
 
