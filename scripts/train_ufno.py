@@ -53,16 +53,52 @@ DEVICE = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("mps") if torch.backends.mps.is_available()
           else torch.device("cpu"))
 
-# ── Feature columns — top groups from ablation study ──────────────────────────
-# Ablation results: wp_couple (R²=0.272) > wind (0.269) > pressure (0.260)
-# Position and land_sea hurt performance (negative R² when used alone)
-TAB_COLS = [
-    "wind_last", "wind_max", "wind_mean", "wind_std",
-    "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
-    "pres_last", "pres_min", "pres_mean", "pres_std",
-    "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
-    "wp_residual",
-]
+# ── Feature columns — loaded dynamically from ablation output ─────────────────
+def _load_tab_cols() -> list:
+    """
+    Load tabular feature columns from ablation-selected groups.
+
+    Priority:
+      1. data/features/selected_feature_groups.json  (written by ablation.py)
+      2. Hardcoded fallback (wind + pressure + wp_couple)
+    """
+    feat_dir = os.path.join(os.path.dirname(__file__), "..", "data", "features")
+    sel_path = os.path.join(feat_dir, "selected_feature_groups.json")
+    grp_path = os.path.join(feat_dir, "feature_groups.json")
+
+    fallback = [
+        "wind_last", "wind_max", "wind_mean", "wind_std",
+        "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
+        "pres_last", "pres_min", "pres_mean", "pres_std",
+        "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
+        "wp_residual",
+    ]
+
+    if not os.path.exists(sel_path) or not os.path.exists(grp_path):
+        print("[train_ufno] selected_feature_groups.json not found — using fallback TAB_COLS.")
+        return fallback
+
+    with open(sel_path) as f:
+        sel = json.load(f)
+    with open(grp_path) as f:
+        groups = json.load(f)
+
+    selected_groups = sel.get("selected_groups", [])
+    cols = []
+    for g in selected_groups:
+        cols.extend(groups.get(g, []))
+    cols = list(dict.fromkeys(cols))   # dedup, preserve order
+
+    if not cols:
+        print("[train_ufno] selected_feature_groups.json produced no columns — using fallback.")
+        return fallback
+
+    print(f"[train_ufno] TAB_COLS loaded from ablation: {len(cols)} features "
+          f"from groups {selected_groups}")
+    return cols
+
+
+TAB_COLS = _load_tab_cols()
 TARGET_COLS = ["wind_24h", "wind_48h"]
 
 
@@ -169,8 +205,18 @@ def load_data(seed: int):
     tab_scaler = StandardScaler()
     tgt_scaler = StandardScaler()
 
-    train_df, tmp_df = train_test_split(df, test_size=0.3, random_state=seed)
-    val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)
+    # Use TCND original splits if available, else fall back to random 70/15/15
+    if "split" in df.columns and df["split"].isin(["train","val","test"]).any():
+        train_df = df[df["split"] == "train"].reset_index(drop=True)
+        val_df   = df[df["split"] == "val"].reset_index(drop=True)
+        test_df  = df[df["split"] == "test"].reset_index(drop=True)
+        print(f"Split      : TCND original  "
+              f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
+    else:
+        train_df, tmp_df = train_test_split(df, test_size=0.3, random_state=seed)
+        val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)
+        print(f"Split      : random 70/15/15  "
+              f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
 
     if mode == "tabular":
         DS = TabularDecayDataset

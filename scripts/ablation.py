@@ -284,6 +284,43 @@ def run():
 
     print("\nAblation complete.")
 
+    # ── Auto-update selected feature groups for train_ufno.py ────────────────
+    _save_selected_groups(res_24, groups)
+
+
+def _save_selected_groups(res_24: pd.DataFrame, groups: dict):
+    """
+    From decay_24h ablation results, pick the best-performing feature groups
+    (by R²) from the single-group rows ('only_*'), then write the selected
+    group names to data/features/selected_feature_groups.json so that
+    train_ufno.py can load them dynamically.
+    """
+    # Only look at single-group runs
+    single = res_24[res_24["label"].str.startswith("only_")].copy()
+    if single.empty:
+        print("  [warn] No single-group rows found — skipping auto-update.")
+        return
+
+    # Parse group name from label ("only_wind" → "wind")
+    single = single.copy()
+    single["group"] = single["label"].str.replace("only_", "", n=1)
+
+    # Keep groups with positive R²
+    positive = single[single["r2_mean"] > 0].sort_values("r2_mean", ascending=False)
+    if positive.empty:
+        print("  [warn] No groups with positive R² — keeping all groups.")
+        selected = list(single["group"])
+    else:
+        selected = list(positive["group"])
+
+    out_path = os.path.join(FEAT_DIR, "selected_feature_groups.json")
+    with open(out_path, "w") as f:
+        json.dump({"selected_groups": selected,
+                   "ranked_by": "r2_mean_decay_24h"}, f, indent=2)
+
+    print(f"\n  Selected feature groups (by R²): {selected}")
+    print(f"  Written to: {out_path}")
+
 
 if __name__ == "__main__":
     run()
