@@ -337,7 +337,7 @@ class CycloneUFNO(nn.Module):
             nn.Linear(width, 128),
             nn.GELU(),
             nn.Dropout(p=0.3),
-            nn.Linear(128, n_outputs),
+            nn.Linear(128, 2),   # [wind_24h, wind_48h]
         )
 
     # -- internal helpers --------------------------------------------------

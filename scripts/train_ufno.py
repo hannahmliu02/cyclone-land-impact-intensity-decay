@@ -72,72 +72,6 @@ DEVICE = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("mps") if torch.backends.mps.is_available()
           else torch.device("cpu"))
 
-<<<<<<< HEAD
-# ── Feature columns — loaded dynamically from ablation output ─────────────────
-_FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
-
-_FALLBACK_COLS = {
-    "landfall": [
-        "wp_residual",
-        "wind_last", "wind_max", "wind_mean", "wind_std",
-        "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
-        "pres_last", "pres_min", "pres_mean", "pres_std",
-        "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
-    ],
-    "decay": [
-        "wind_last", "wind_max", "wind_mean", "wind_std",
-        "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
-        "pres_last", "pres_min", "pres_mean", "pres_std",
-        "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
-        "wp_residual",
-    ],
-}
-
-def _load_tab_cols(task: str) -> list:
-    """
-    Load tabular feature columns from the task-specific ablation selection.
-
-    Priority:
-      1. data/features/selected_feature_groups_{task}.json  (written by ablation.py)
-      2. data/features/selected_feature_groups.json         (legacy fallback)
-      3. Hardcoded fallback
-    """
-    grp_path = os.path.join(_FEAT_DIR, "feature_groups.json")
-    fallback  = _FALLBACK_COLS[task]
-
-    # Candidate paths in priority order
-    candidates = [
-        os.path.join(_FEAT_DIR, f"selected_feature_groups_{task}.json"),
-        os.path.join(_FEAT_DIR, "selected_feature_groups.json"),
-    ]
-    sel_path = next((p for p in candidates if os.path.exists(p)), None)
-
-    if sel_path is None or not os.path.exists(grp_path):
-        print(f"[train_ufno] No ablation selection found for '{task}' — using fallback TAB_COLS.")
-        return fallback
-
-    with open(sel_path) as f:
-        sel = json.load(f)
-    with open(grp_path) as f:
-        groups = json.load(f)
-
-    selected_groups = sel.get("selected_groups", [])
-    cols = []
-    for g in selected_groups:
-        cols.extend(groups.get(g, []))
-    cols = list(dict.fromkeys(cols))   # dedup, preserve order
-
-    if not cols:
-        print(f"[train_ufno] Ablation selection for '{task}' produced no columns — using fallback.")
-        return fallback
-
-    print(f"[train_ufno] TAB_COLS ({task}): {len(cols)} features "
-          f"from groups {selected_groups}  [{os.path.basename(sel_path)}]")
-    return cols
-
-
-TAB_COLS    = _load_tab_cols("decay")   # overridden per-task in load_data()
-=======
 # ── Feature columns — top groups from ablation study ──────────────────────────
 # Ablation results: wp_couple (R²=0.272) > wind (0.269) > pressure (0.260)
 # Position and land_sea hurt performance (negative R² when used alone)
@@ -148,7 +82,6 @@ TAB_COLS = [
     "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
     "wp_residual",
 ]
->>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
 TARGET_COLS = ["wind_24h", "wind_48h"]
 LANDFALL_TARGET = "hours_to_landfall"
 
@@ -310,16 +243,6 @@ def _collate_spatial(batch):
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-<<<<<<< HEAD
-def _split_df(df, seed):
-    """Apply TCND original splits if available, else random 70/15/15."""
-    if "split" in df.columns and df["split"].isin(["train","val","test"]).any():
-        train_df = df[df["split"] == "train"].reset_index(drop=True)
-        val_df   = df[df["split"] == "val"].reset_index(drop=True)
-        test_df  = df[df["split"] == "test"].reset_index(drop=True)
-        print(f"Split      : TCND original  "
-              f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
-=======
 def load_data(seed: int):
     """Return (train_loader, val_loader, test_loader, meta, mode, tab_dim)."""
     samples_csv = os.path.join(PROC_DIR, "samples.csv")
@@ -334,7 +257,6 @@ def load_data(seed: int):
         mode = "tabular"
         df   = pd.read_csv(decay_csv, keep_default_na=False)
         df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
->>>>>>> aa2e0e6 (Fix NA basin dropped as NaN when reading CSVs; use ablation top features)
     else:
         train_df, tmp_df = train_test_split(df, test_size=0.3, random_state=seed)
         val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)
@@ -442,12 +364,17 @@ def load_data(seed: int, task: str = "decay", batch: int = 8,
     val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
     test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
 
-    # Basin-weighted sampler: oversample EP
-    basin_counts   = train_df["basin"].value_counts().to_dict()
+    # Basin-weighted sampler: inverse-frequency weighting so EP is oversampled
+    basin_counts = train_df["basin"].value_counts().to_dict()
     sample_weights = train_df["basin"].map(
         lambda b: 1.0 / basin_counts.get(b, 1)).values
-    sampler = WeightedRandomSampler(sample_weights, len(sample_weights),
-                                    replacement=True)
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    kw = dict(batch_size=8, num_workers=0, collate_fn=collate)
+    train_loader = DataLoader(train_ds, sampler=sampler, **kw)
+    val_loader   = DataLoader(val_ds,   shuffle=False,   **kw)
+    test_loader  = DataLoader(test_ds,  shuffle=False,   **kw)
 
     kw = dict(batch_size=batch, num_workers=0, collate_fn=collate)
     tab_cols = [c for c in tab_cols_for_task if c in df.columns]
@@ -640,9 +567,7 @@ def main():
         modes1       = args.modes,
         modes2       = args.modes,
         width        = args.width,
-        unet_dropout = args.unet_dropout,
-        n_outputs    = n_outputs,
-        lf_embed_dim = lf_embed_dim,
+        unet_dropout = 0.2,
     ).to(DEVICE)
 
     print(f"\nTask       : {task}")
@@ -650,8 +575,11 @@ def main():
     print(f"Device     : {DEVICE}")
     print(f"Epochs     : {args.epochs}")
 
-    # ── Loss ───────────────────────────────────────────────────────────────
-    criterion = nn.MSELoss() if task == "landfall" else LpLoss(p=2)
+    criterion = LpLoss(p=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
+                                 weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-5)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-3)
@@ -678,8 +606,8 @@ def main():
             model, train_loader, mode, DEVICE, optimizer, criterion,
             desc=f"Ep {epoch:>3} train", show_bar=True, lf_model=lf_model)
         vl_loss, vl_mae = run_epoch(
-            model, val_loader, mode, DEVICE, criterion=criterion,
-            desc=f"Ep {epoch:>3} val  ", show_bar=True, lf_model=lf_model)
+            model, val_loader, mode, DEVICE,
+            desc=f"Ep {epoch:>3} val  ", show_bar=True)
         scheduler.step(vl_loss)
 
         history["train_loss"].append(tr_loss)
