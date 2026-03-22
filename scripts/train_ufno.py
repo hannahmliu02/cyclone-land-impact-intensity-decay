@@ -1,29 +1,47 @@
 """
-Train CycloneUFNO for post-landfall intensity decay prediction.
+Train CycloneUFNO — landfall impact or intensity decay.
 
-Two data modes (auto-detected):
+Two tasks
+─────────
+  landfall  — binary classification: will this storm make landfall?
+               Uses feature_matrix_landfall.csv, BCEWithLogitsLoss
+               Saves: best_ufno_landfall.pt
+
+  decay     — regression: wind speed 24h and 48h after reference time
+               Uses feature_matrix_decay.csv, LpLoss
+               Saves: best_ufno_decay.pt
+               Optionally accepts --landfall-ckpt to inject a learned
+               landfall embedding into the model via FiLM at blocks 3–5
+
+Two data modes (auto-detected for decay task):
   spatial   — processed tensors from preprocess.py exist in data/processed/
-               Uses Data_3d patches + tabular features + env features
-  tabular   — only feature_matrix_decay.csv from features.py is available
-               Uses tabular features only (no 3-D patches)
+  tabular   — only feature_matrix_decay.csv is available (default fallback)
 
 Usage
 ─────
-  python scripts/train_ufno.py [options]
+  # Step 1 — train landfall model
+  python scripts/train_ufno.py --task landfall --epochs 100
+
+  # Step 2 — train decay model with landfall embedding
+  python scripts/train_ufno.py --task decay --epochs 150 \\
+      --landfall-ckpt models/best_ufno_landfall.pt
 
 Options
-  --epochs   int    Training epochs                    (default 100)
-  --batch    int    Batch size                         (default 8)
-  --lr       float  Initial learning rate              (default 1e-3)
-  --modes    int    Fourier modes (modes1 = modes2)    (default 12)
-  --width    int    UFNO hidden width                  (default 32)
-  --no-tab         Disable tabular FiLM conditioning
-  --seed     int    Random seed                        (default 42)
+  --task          {landfall,decay}  Which task to train  (default decay)
+  --landfall-ckpt PATH              Landfall checkpoint for embedding injection
+  --epochs        int               Training epochs      (default 100)
+  --batch         int               Batch size           (default 8)
+  --lr            float             Initial LR           (default 1e-3)
+  --modes         int               Fourier modes        (default 12)
+  --width         int               UFNO hidden width    (default 32)
+  --unet-dropout  float             UNet dropout         (default 0.2)
+  --no-tab                          Disable tabular FiLM conditioning
+  --seed          int               Random seed          (default 42)
 
 Outputs (models/)
-  best_ufno.pt          — best validation checkpoint
-  last_ufno.pt          — final epoch checkpoint
-  ufno_history.json     — per-epoch loss / metric log
+  best_ufno_landfall.pt   — best landfall checkpoint
+  best_ufno_decay.pt      — best decay checkpoint
+  ufno_history.json       — per-epoch loss / metric log
 """
 
 import argparse
@@ -98,11 +116,30 @@ def _load_tab_cols() -> list:
     return cols
 
 
-TAB_COLS = _load_tab_cols()
+TAB_COLS    = _load_tab_cols()
 TARGET_COLS = ["wind_24h", "wind_48h"]
+LANDFALL_TARGET = "made_landfall"
 
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
+class LandfallDataset(Dataset):
+    """Tabular dataset for landfall binary classification."""
+
+    def __init__(self, df: pd.DataFrame,
+                 tab_scaler: StandardScaler,
+                 fit: bool = False):
+        tab_cols = [c for c in TAB_COLS if c in df.columns]
+        X = df[tab_cols].fillna(0).values.astype(np.float32)
+        y = df[LANDFALL_TARGET].values.astype(np.float32)
+        self.X = torch.tensor(tab_scaler.fit_transform(X) if fit
+                              else tab_scaler.transform(X), dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N,1)
+        self.meta = df[["storm_id", "basin"]].reset_index(drop=True)
+
+    def __len__(self):  return len(self.X)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+
 class TabularDecayDataset(Dataset):
     """Tabular-only dataset — no spatial patches required."""
 
@@ -180,32 +217,8 @@ def _collate_spatial(batch):
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-def load_data(seed: int):
-    """Return (train_loader, val_loader, test_loader, meta, mode, tab_dim)."""
-    samples_csv = os.path.join(PROC_DIR, "samples.csv")
-    decay_csv   = os.path.join(FEAT_DIR,  "feature_matrix_decay.csv")
-
-    # Prefer processed tensors; fall back to feature matrix
-    if os.path.exists(samples_csv):
-        mode = "spatial"
-        df   = pd.read_csv(samples_csv, keep_default_na=False)
-        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
-    elif os.path.exists(decay_csv):
-        mode = "tabular"
-        df   = pd.read_csv(decay_csv, keep_default_na=False)
-        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
-    else:
-        raise FileNotFoundError(
-            "No data found. Run features.py (tabular mode) or "
-            "preprocess.py (spatial mode) first.")
-
-    print(f"Data mode  : {mode}")
-    print(f"Samples    : {len(df)}  |  basins: {df['basin'].value_counts().to_dict()}")
-
-    tab_scaler = StandardScaler()
-    tgt_scaler = StandardScaler()
-
-    # Use TCND original splits if available, else fall back to random 70/15/15
+def _split_df(df, seed):
+    """Apply TCND original splits if available, else random 70/15/15."""
     if "split" in df.columns and df["split"].isin(["train","val","test"]).any():
         train_df = df[df["split"] == "train"].reset_index(drop=True)
         val_df   = df[df["split"] == "val"].reset_index(drop=True)
@@ -217,62 +230,140 @@ def load_data(seed: int):
         val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)
         print(f"Split      : random 70/15/15  "
               f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
+    return train_df, val_df, test_df
+
+
+def load_data(seed: int, task: str = "decay", batch: int = 8):
+    """Return (train_loader, val_loader, test_loader, meta, tgt_scaler)."""
+
+    if task == "landfall":
+        csv = os.path.join(FEAT_DIR, "feature_matrix_landfall.csv")
+        if not os.path.exists(csv):
+            raise FileNotFoundError("Run features.py first — feature_matrix_landfall.csv not found.")
+        df = pd.read_csv(csv, keep_default_na=False)
+        df = df.dropna(subset=[LANDFALL_TARGET]).reset_index(drop=True)
+        print(f"Task       : landfall (binary classification)")
+        print(f"Samples    : {len(df)}  |  basins: {df['basin'].value_counts().to_dict()}")
+        print(f"Landfall % : {df[LANDFALL_TARGET].mean()*100:.1f}%")
+
+        tab_scaler = StandardScaler()
+        train_df, val_df, test_df = _split_df(df, seed)
+
+        train_ds = LandfallDataset(train_df, tab_scaler, fit=True)
+        val_ds   = LandfallDataset(val_df,   tab_scaler, fit=False)
+        test_ds  = LandfallDataset(test_df,  tab_scaler, fit=False)
+
+        # Class-balanced sampler for imbalanced landfall labels
+        pos_weight = (train_df[LANDFALL_TARGET] == 0).sum() / \
+                     max((train_df[LANDFALL_TARGET] == 1).sum(), 1)
+        weights = train_df[LANDFALL_TARGET].map(
+            lambda y: float(pos_weight) if y == 1 else 1.0).values
+        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+
+        tab_cols = [c for c in TAB_COLS if c in df.columns]
+        meta = {
+            "task":    "landfall",
+            "mode":    "tabular",
+            "tab_dim": len(tab_cols),
+            "tab_cols": tab_cols,
+            "n_train": len(train_ds),
+            "n_val":   len(val_ds),
+            "n_test":  len(test_ds),
+        }
+        kw = dict(batch_size=batch, num_workers=0)
+        return (DataLoader(train_ds, sampler=sampler, **kw),
+                DataLoader(val_ds,   shuffle=False,   **kw),
+                DataLoader(test_ds,  shuffle=False,   **kw),
+                meta, None)
+
+    # ── decay task ────────────────────────────────────────────────────────────
+    samples_csv = os.path.join(PROC_DIR, "samples.csv")
+    decay_csv   = os.path.join(FEAT_DIR,  "feature_matrix_decay.csv")
+
+    if os.path.exists(samples_csv):
+        mode = "spatial"
+        df   = pd.read_csv(samples_csv, keep_default_na=False)
+        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
+    elif os.path.exists(decay_csv):
+        mode = "tabular"
+        df   = pd.read_csv(decay_csv, keep_default_na=False)
+        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
+    else:
+        raise FileNotFoundError(
+            "No data found. Run features.py (tabular) or preprocess.py (spatial).")
+
+    print(f"Task       : decay (regression)")
+    print(f"Data mode  : {mode}")
+    print(f"Samples    : {len(df)}  |  basins: {df['basin'].value_counts().to_dict()}")
+
+    tab_scaler = StandardScaler()
+    tgt_scaler = StandardScaler()
+    train_df, val_df, test_df = _split_df(df, seed)
 
     if mode == "tabular":
-        DS = TabularDecayDataset
-        collate = None
+        DS, collate = TabularDecayDataset, None
     else:
-        DS = SpatialDecayDataset
-        collate = _collate_spatial
+        DS, collate = SpatialDecayDataset, _collate_spatial
 
     train_ds = DS(train_df, tab_scaler, tgt_scaler, fit=True)
     val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False)
     test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False)
 
-    # Basin-weighted sampler: inverse-frequency weighting so EP is oversampled
-    basin_counts = train_df["basin"].value_counts().to_dict()
+    # Basin-weighted sampler: oversample EP
+    basin_counts   = train_df["basin"].value_counts().to_dict()
     sample_weights = train_df["basin"].map(
         lambda b: 1.0 / basin_counts.get(b, 1)).values
-    sampler = WeightedRandomSampler(
-        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights),
+                                    replacement=True)
 
-    kw = dict(batch_size=8, num_workers=0, collate_fn=collate)
-    train_loader = DataLoader(train_ds, sampler=sampler, **kw)
-    val_loader   = DataLoader(val_ds,   shuffle=False,   **kw)
-    test_loader  = DataLoader(test_ds,  shuffle=False,   **kw)
-
+    kw = dict(batch_size=batch, num_workers=0, collate_fn=collate)
     tab_cols = [c for c in TAB_COLS if c in df.columns]
     meta = {
-        "mode":        mode,
-        "tab_dim":     len(tab_cols),
-        "tab_cols":    tab_cols,
-        "tgt_mean":    tgt_scaler.mean_.tolist(),
-        "tgt_scale":   tgt_scaler.scale_.tolist(),
-        "n_train":     len(train_ds),
-        "n_val":       len(val_ds),
-        "n_test":      len(test_ds),
+        "task":      "decay",
+        "mode":      mode,
+        "tab_dim":   len(tab_cols),
+        "tab_cols":  tab_cols,
+        "tgt_mean":  tgt_scaler.mean_.tolist(),
+        "tgt_scale": tgt_scaler.scale_.tolist(),
+        "n_train":   len(train_ds),
+        "n_val":     len(val_ds),
+        "n_test":    len(test_ds),
     }
-    return train_loader, val_loader, test_loader, meta, tgt_scaler
+    return (DataLoader(train_ds, sampler=sampler, **kw),
+            DataLoader(val_ds,   shuffle=False,   **kw),
+            DataLoader(test_ds,  shuffle=False,   **kw),
+            meta, tgt_scaler)
 
 
 # ── Training / evaluation loops ───────────────────────────────────────────────
-def _forward(model, batch, mode: str, device):
+def _forward(model, batch, mode: str, device, lf_model=None):
+    """
+    Run one forward pass.  lf_model: frozen landfall model for embedding injection.
+    """
     if mode == "tabular":
         x_tab, y = batch
         x_tab = x_tab.to(device)
         y     = y.to(device)
-        pred  = model(x_tab=x_tab)
+        lf_embed = None
+        if lf_model is not None:
+            with torch.no_grad():
+                lf_embed = lf_model.extract_embedding(x_tab=x_tab)
+        pred = model(x_tab=x_tab, lf_embed=lf_embed)
     else:
         x3d, x_tab, y = batch
         x3d   = x3d.to(device)   if x3d is not None else None
         x_tab = x_tab.to(device)
         y     = y.to(device)
-        pred  = model(x_3d=x3d, x_tab=x_tab)
+        lf_embed = None
+        if lf_model is not None:
+            with torch.no_grad():
+                lf_embed = lf_model.extract_embedding(x_tab=x_tab, x_3d=x3d)
+        pred = model(x_3d=x3d, x_tab=x_tab, lf_embed=lf_embed)
     return pred, y
 
 
 def run_epoch(model, loader, mode, device, optimizer=None, criterion=None,
-              desc="", show_bar=True):
+              desc="", show_bar=True, lf_model=None):
     from tqdm import tqdm
     if criterion is None:
         criterion = LpLoss(p=2)
@@ -291,7 +382,7 @@ def run_epoch(model, loader, mode, device, optimizer=None, criterion=None,
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for batch in bar:
-            pred, y = _forward(model, batch, mode, device)
+            pred, y = _forward(model, batch, mode, device, lf_model=lf_model)
             loss = criterion(pred, y)
 
             if training:
@@ -336,6 +427,12 @@ def _loss_bar(train_vals, val_vals, width=38):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task",   default="decay",
+                        choices=["landfall", "decay"],
+                        help="Which task to train (default: decay)")
+    parser.add_argument("--landfall-ckpt", default=None,
+                        help="Path to landfall checkpoint for embedding injection "
+                             "(decay task only)")
     parser.add_argument("--epochs", type=int,   default=100)
     parser.add_argument("--batch",  type=int,   default=8)
     parser.add_argument("--lr",     type=float, default=1e-3)
@@ -352,10 +449,44 @@ def main():
     np.random.seed(args.seed)
 
     train_loader, val_loader, test_loader, meta, tgt_scaler = \
-        load_data(args.seed)
+        load_data(args.seed, task=args.task, batch=args.batch)
 
-    mode  = meta["mode"]
+    mode = meta["mode"]
+    task = args.task
 
+    # ── Load frozen landfall model for embedding injection ─────────────────
+    lf_model     = None
+    lf_embed_dim = 0
+    if task == "decay" and args.landfall_ckpt:
+        lf_ckpt_path = args.landfall_ckpt
+        if not os.path.exists(lf_ckpt_path):
+            raise FileNotFoundError(
+                f"Landfall checkpoint not found: {lf_ckpt_path}\n"
+                f"Train landfall model first: "
+                f"python scripts/train_ufno.py --task landfall")
+        lf_ckpt = torch.load(lf_ckpt_path, map_location=DEVICE)
+        lf_args = lf_ckpt.get("args", {})
+        lf_meta = lf_ckpt.get("meta", {})
+        lf_model = CycloneUFNO(
+            sp_channels  = 5,
+            T            = 8,
+            tab_features = lf_meta.get("tab_dim", meta["tab_dim"]),
+            modes1       = lf_args.get("modes", 12),
+            modes2       = lf_args.get("modes", 12),
+            width        = lf_args.get("width", args.width),
+            unet_dropout = lf_args.get("unet_dropout", 0.0),
+            n_outputs    = 1,
+        ).to(DEVICE)
+        lf_model.load_state_dict(lf_ckpt["state"])
+        lf_model.eval()
+        for p in lf_model.parameters():
+            p.requires_grad = False
+        lf_embed_dim = lf_args.get("width", args.width)
+        print(f"Landfall model loaded from {lf_ckpt_path}")
+        print(f"Landfall embedding dim: {lf_embed_dim} (injected at blocks 3–5)")
+
+    # ── Build model ────────────────────────────────────────────────────────
+    n_outputs = 1 if task == "landfall" else 2
     model = CycloneUFNO(
         sp_channels  = 5,
         T            = 8,
@@ -364,21 +495,30 @@ def main():
         modes2       = args.modes,
         width        = args.width,
         unet_dropout = args.unet_dropout,
+        n_outputs    = n_outputs,
+        lf_embed_dim = lf_embed_dim,
     ).to(DEVICE)
 
-    print(f"\nModel      : CycloneUFNO  ({model.count_params():,} params)")
+    print(f"\nTask       : {task}")
+    print(f"Model      : CycloneUFNO  ({model.count_params():,} params)")
     print(f"Device     : {DEVICE}")
     print(f"Epochs     : {args.epochs}")
 
-    criterion = LpLoss(p=2)
+    # ── Loss ───────────────────────────────────────────────────────────────
+    if task == "landfall":
+        # Class imbalance: weight positive class
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = LpLoss(p=2)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-5)
 
-    history = {"train_loss": [], "val_loss": [],
-               "train_mae": [],  "val_mae": []}
+    history  = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
     best_val = float("inf")
+    ckpt_name = f"best_ufno_{task}.pt"
 
     header = (f"{'Epoch':>6}  {'Train':>8}  {'Val':>8}  "
               f"{'ValMAE':>8}  {'LR':>8}  {'Time':>6}  {'':>4}")
@@ -392,10 +532,10 @@ def main():
 
         tr_loss, tr_mae = run_epoch(
             model, train_loader, mode, DEVICE, optimizer, criterion,
-            desc=f"Ep {epoch:>3} train", show_bar=True)
+            desc=f"Ep {epoch:>3} train", show_bar=True, lf_model=lf_model)
         vl_loss, vl_mae = run_epoch(
-            model, val_loader, mode, DEVICE,
-            desc=f"Ep {epoch:>3} val  ", show_bar=True)
+            model, val_loader, mode, DEVICE, criterion=criterion,
+            desc=f"Ep {epoch:>3} val  ", show_bar=True, lf_model=lf_model)
         scheduler.step(vl_loss)
 
         history["train_loss"].append(tr_loss)
@@ -406,55 +546,55 @@ def main():
         is_best = vl_loss < best_val
         if is_best:
             best_val = vl_loss
-            torch.save({
+            ckpt = {
                 "epoch":      epoch,
                 "state":      model.state_dict(),
                 "meta":       meta,
                 "args":       vars(args),
-                "tgt_mean":   tgt_scaler.mean_.tolist(),
-                "tgt_scale":  tgt_scaler.scale_.tolist(),
-            }, os.path.join(MODELS_DIR, "best_ufno.pt"))
+            }
+            if tgt_scaler is not None:
+                ckpt["tgt_mean"]  = tgt_scaler.mean_.tolist()
+                ckpt["tgt_scale"] = tgt_scaler.scale_.tolist()
+            torch.save(ckpt, os.path.join(MODELS_DIR, ckpt_name))
 
         elapsed = time.time() - t0
         star    = "★" if is_best else " "
         print(f"{epoch:>6}  {tr_loss:>8.4f}  {vl_loss:>8.4f}  "
               f"{vl_mae:>8.4f}  {lr_now:>8.2e}  {elapsed:>5.1f}s  {star}")
 
-        # Print ASCII loss sparkline every 5 epochs
         if epoch % 5 == 0 or epoch == args.epochs:
             _loss_bar(history["train_loss"], history["val_loss"])
             print()
 
         sys.stdout.flush()
 
-    # Save last checkpoint and history
-    torch.save({
-        "epoch":     args.epochs,
-        "state":     model.state_dict(),
-        "meta":      meta,
-        "args":      vars(args),
-        "tgt_mean":  tgt_scaler.mean_.tolist(),
-        "tgt_scale": tgt_scaler.scale_.tolist(),
-    }, os.path.join(MODELS_DIR, "last_ufno.pt"))
+    # ── Save last checkpoint + history ────────────────────────────────────
+    last_ckpt = {
+        "epoch": args.epochs, "state": model.state_dict(),
+        "meta": meta, "args": vars(args),
+    }
+    if tgt_scaler is not None:
+        last_ckpt["tgt_mean"]  = tgt_scaler.mean_.tolist()
+        last_ckpt["tgt_scale"] = tgt_scaler.scale_.tolist()
+    torch.save(last_ckpt, os.path.join(MODELS_DIR, f"last_ufno_{task}.pt"))
 
     hist_path = os.path.join(MODELS_DIR, "ufno_history.json")
     with open(hist_path, "w") as f:
         json.dump(history, f, indent=2)
 
-    # ── Test evaluation ───────────────────────────────────────────────
-    ckpt = torch.load(os.path.join(MODELS_DIR, "best_ufno.pt"),
-                      map_location=DEVICE)
+    # ── Test evaluation ───────────────────────────────────────────────────
+    ckpt = torch.load(os.path.join(MODELS_DIR, ckpt_name), map_location=DEVICE)
     model.load_state_dict(ckpt["state"])
-    test_loss, test_mae = run_epoch(model, test_loader, mode, DEVICE)
+    test_loss, test_mae = run_epoch(model, test_loader, mode, DEVICE,
+                                    criterion=criterion, lf_model=lf_model)
     print(f"\nTest loss  : {test_loss:.4f}")
-    print(f"Test MAE   : {test_mae:.4f}  (normalised)")
-
-    # Denormalise MAE back to knots
-    scale = np.array(tgt_scaler.scale_)
-    print(f"Test MAE   : wind_24h ≈ {test_mae * scale[0]:.2f} kt  "
-          f"| wind_48h ≈ {test_mae * scale[1]:.2f} kt  (approx.)")
-    print(f"\nCheckpoints saved in  {MODELS_DIR}/")
-    print(f"History saved to      {hist_path}")
+    print(f"Test MAE   : {test_mae:.4f}")
+    if task == "decay" and tgt_scaler is not None:
+        scale = np.array(tgt_scaler.scale_)
+        print(f"Test MAE   : wind_24h ≈ {test_mae * scale[0]:.2f}  "
+              f"| wind_48h ≈ {test_mae * scale[1]:.2f}  (normalised units)")
+    print(f"\nCheckpoint : {MODELS_DIR}/{ckpt_name}")
+    print(f"History    : {hist_path}")
 
 
 if __name__ == "__main__":

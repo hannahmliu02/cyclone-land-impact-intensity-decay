@@ -1,33 +1,48 @@
 """
-U-FNO for Cyclone Intensity Decay Prediction
-=============================================
+U-FNO for Cyclone Prediction
+=============================
 Adapted from Gege Wen et al., "U-FNO — An enhanced Fourier neural operator
 based deep learning model for multiphase flow" (2022).
   Repository : https://github.com/gegewen/ufno
 
+Supports two tasks
+──────────────────
+  landfall  — binary classification: will this storm make landfall?
+              n_outputs=1, BCEWithLogitsLoss, output is a logit
+  decay     — regression: wind speed at 24h and 48h
+              n_outputs=2, LpLoss, output is [wind_24h, wind_48h]
+
 Architecture overview
 ─────────────────────
-Two input modes are supported:
+Two input modes:
 
   spatial (default)
     Primary : Data_3d patches  (B, T, C_sp, H, W)
-              Reshaped to      (B, H, W, T * C_sp)  before entering UFNO
     Optional: tabular features (B, F_tab) injected via FiLM at every block
 
   tabular-only
-    Tabular features (B, F_tab) are projected onto a (G × G) pseudo-grid
-    (default G = 16) and processed by the identical UFNO stack.
+    Tabular features (B, F_tab) projected onto a (G × G) pseudo-grid
+    and processed by the identical UFNO stack.
+
+Landfall embedding injection
+─────────────────────────────
+When training the decay model, a frozen landfall model provides a
+learned embedding (B, width) via extract_embedding(). This is injected
+into the decay model's UFNO stack at blocks 3–5 via dedicated FiLM
+layers — separate from the tabular FiLM — so landfall information
+modulates the spatial field, not just the input features.
 
 UFNO block (2-D, repeated 6×)
   SpectralConv2d   — Fourier modes over (H, W)
   + W_local        — pointwise Conv2d for local mixing
   + UNet2d         — U-shaped skip-connection branch (at blocks 3–5)
-  + FiLM           — affine conditioning from tabular features
+  + FiLM (tab)     — affine conditioning from tabular features
+  + FiLM (lf)      — affine conditioning from landfall embedding (blocks 3–5 only)
   + GELU activation
 
 Prediction head
-  Global average pool  →  Linear(width → 128)  →  Linear(128 → 2)
-  Outputs: [wind_24h, wind_48h]  (knots, regression)
+  Global average pool → Linear(width → 128) → GELU → Dropout(0.3)
+  → Linear(128 → n_outputs)
 """
 
 from typing import Optional
@@ -205,9 +220,12 @@ class CycloneUFNOStack(nn.Module):
     """
 
     def __init__(self, width: int, modes1: int, modes2: int,
-                 tab_dim: int, unet_dropout: float = 0.0):
+                 tab_dim: int, unet_dropout: float = 0.0,
+                 lf_embed_dim: int = 0):
         super().__init__()
-        self.n_blocks = 6
+        self.n_blocks    = 6
+        self.lf_embed_dim = lf_embed_dim
+        self._lf_blocks  = (3, 4, 5)   # blocks where landfall FiLM is applied
 
         self.spec  = nn.ModuleList(
             [SpectralConv2d(width, width, modes1, modes2)
@@ -222,16 +240,28 @@ class CycloneUFNOStack(nn.Module):
         })
         self.film  = nn.ModuleList(
             [FiLM(tab_dim, width) for _ in range(self.n_blocks)])
+        # Separate FiLM layers for landfall embedding — only at blocks 3–5
+        if lf_embed_dim > 0:
+            self.lf_film = nn.ModuleList(
+                [FiLM(lf_embed_dim, width) for _ in self._lf_blocks])
         self.act   = nn.GELU()
 
     def forward(self, x: torch.Tensor,
-                tab: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x : (B, width, H, W)
+                tab: Optional[torch.Tensor] = None,
+                lf_embed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x        : (B, width, H, W)
+        # tab      : (B, tab_dim)       or None
+        # lf_embed : (B, lf_embed_dim)  or None
+        lf_idx = 0
         for i in range(self.n_blocks):
             h = self.spec[i](x) + self.wlin[i](x)
             if str(i) in self.unets:
                 h = h + self.unets[str(i)](x)
             h = self.film[i](h, tab)
+            if self.lf_embed_dim > 0 and lf_embed is not None \
+                    and i in self._lf_blocks:
+                h = self.lf_film[lf_idx](h, lf_embed)
+                lf_idx += 1
             x = self.act(h)
         return x   # (B, width, H, W)
 
@@ -251,18 +281,23 @@ class CycloneUFNO(nn.Module):
     grid_size     : G for tabular-only pseudo-grid       (default 16)
     pad_size      : replication padding added to edges   (default 4)
     unet_dropout  : dropout inside UNet2d branches       (default 0.0)
+    n_outputs     : 1 for landfall classification, 2 for decay regression
+    lf_embed_dim  : dim of landfall embedding for decay model (0 = disabled)
 
     Forward inputs
     --------------
-    x_3d  : (B, T, C_sp, H, W)  or None — spatial patches
-    x_tab : (B, F_tab)           or None — tabular features
+    x_3d     : (B, T, C_sp, H, W)  or None — spatial patches
+    x_tab    : (B, F_tab)           or None — tabular features
+    lf_embed : (B, lf_embed_dim)    or None — landfall embedding from
+               a frozen landfall model, injected via FiLM at blocks 3–5
 
     At least one of x_3d / x_tab must be provided.
     If only x_tab is given, the model runs in tabular-only mode.
 
     Forward output
     --------------
-    (B, 2) — predicted [wind_24h, wind_48h] in knots
+    landfall task : (B, 1) — logit (apply sigmoid for probability)
+    decay task    : (B, 2) — predicted [wind_24h, wind_48h]
     """
 
     def __init__(self,
@@ -274,33 +309,35 @@ class CycloneUFNO(nn.Module):
                  width:        int = 32,
                  grid_size:    int = 16,
                  pad_size:     int = 4,
-                 unet_dropout: float = 0.0):
+                 unet_dropout: float = 0.0,
+                 n_outputs:    int = 2,
+                 lf_embed_dim: int = 0):
         super().__init__()
 
-        self.T          = T
-        self.width      = width
-        self.pad_size   = pad_size
-        self.grid_size  = grid_size
-        self.tab_dim    = tab_features
+        self.T           = T
+        self.width       = width
+        self.pad_size    = pad_size
+        self.grid_size   = grid_size
+        self.tab_dim     = tab_features
+        self.n_outputs   = n_outputs
+        self.lf_embed_dim = lf_embed_dim
 
         # ── Input projections ──────────────────────────────────────────
-        # Spatial mode: T * C_sp channels → width
         sp_in = T * sp_channels
         self.input_proj_sp  = nn.Linear(sp_in, width)
-
-        # Tabular-only mode: project to G*G*width, reshape to (B, width, G, G)
         self.input_proj_tab = nn.Linear(tab_features, grid_size * grid_size * width)
 
         # ── UFNO stack ─────────────────────────────────────────────────
         self.stack = CycloneUFNOStack(width, modes1, modes2,
-                                      tab_features, unet_dropout)
+                                      tab_features, unet_dropout,
+                                      lf_embed_dim=lf_embed_dim)
 
         # ── Prediction head ────────────────────────────────────────────
         self.head = nn.Sequential(
             nn.Linear(width, 128),
             nn.GELU(),
             nn.Dropout(p=0.3),
-            nn.Linear(128, 2),   # [wind_24h, wind_48h]
+            nn.Linear(128, n_outputs),
         )
 
     # -- internal helpers --------------------------------------------------
@@ -314,35 +351,55 @@ class CycloneUFNO(nn.Module):
 
     # -- forward -----------------------------------------------------------
     def forward(self,
-                x_3d:  Optional[torch.Tensor] = None,
-                x_tab: Optional[torch.Tensor] = None) -> torch.Tensor:
+                x_3d:     Optional[torch.Tensor] = None,
+                x_tab:    Optional[torch.Tensor] = None,
+                lf_embed: Optional[torch.Tensor] = None) -> torch.Tensor:
         if x_3d is None and x_tab is None:
             raise ValueError("At least one of x_3d or x_tab must be provided.")
 
         # ── Build spatial field ────────────────────────────────────────
         if x_3d is not None:
             B, T, C, H, W = x_3d.shape
-            # Fold T and C into a single channel axis → (B, H, W, T*C)
             field = x_3d.permute(0, 3, 4, 1, 2).reshape(B, H, W, T * C)
-            # Project to width → (B, H, W, width)
             field = self.input_proj_sp(field)
-            # UFNO expects (B, width, H, W)
             field = field.permute(0, 3, 1, 2)
         else:
-            # Tabular-only: project to pseudo spatial grid
             B = x_tab.shape[0]
             G = self.grid_size
-            field = self.input_proj_tab(x_tab)           # (B, G*G*width)
-            field = field.view(B, self.width, G, G)       # (B, width, G, G)
+            field = self.input_proj_tab(x_tab)
+            field = field.view(B, self.width, G, G)
 
         # ── Pad → UFNO stack → unpad ───────────────────────────────────
         field = self._pad(field)
-        field = self.stack(field, x_tab)
+        field = self.stack(field, x_tab, lf_embed)
         field = self._unpad(field)
 
         # ── Global average pool → head ─────────────────────────────────
         pooled = field.mean(dim=(-2, -1))   # (B, width)
-        return self.head(pooled)             # (B, 2)
+        return self.head(pooled)             # (B, n_outputs)
+
+    def extract_embedding(self,
+                          x_tab: Optional[torch.Tensor] = None,
+                          x_3d:  Optional[torch.Tensor] = None
+                          ) -> torch.Tensor:
+        """
+        Return the pooled field representation (B, width) before the head.
+        Used by the decay model to extract landfall conditioning signal.
+        """
+        if x_3d is None and x_tab is None:
+            raise ValueError("At least one of x_3d or x_tab must be provided.")
+        if x_3d is not None:
+            B, T, C, H, W = x_3d.shape
+            field = x_3d.permute(0, 3, 4, 1, 2).reshape(B, H, W, T * C)
+            field = self.input_proj_sp(field).permute(0, 3, 1, 2)
+        else:
+            B = x_tab.shape[0]
+            G = self.grid_size
+            field = self.input_proj_tab(x_tab).view(B, self.width, G, G)
+        field = self._pad(field)
+        field = self.stack(field, x_tab)
+        field = self._unpad(field)
+        return field.mean(dim=(-2, -1))     # (B, width)
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
