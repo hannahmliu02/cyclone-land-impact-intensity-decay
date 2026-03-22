@@ -1,17 +1,17 @@
 # Cyclone Land-Impact Intensity Decay
 
-Predicting tropical cyclone intensity decay after landfall using the **TropiCycloneNet Dataset (TCND)** and a **U-shaped Fourier Neural Operator (UFNO)**.
+Predicting tropical cyclone **landfall impact** and **post-landfall intensity decay** using the **TropiCycloneNet Dataset (TCND)** and a **U-shaped Fourier Neural Operator (UFNO)**.
 
 ---
 
 ## Overview
 
-This project addresses two prediction tasks:
+Two prediction tasks:
 
-1. **Landfall prediction** — binary classification: will a storm make landfall?
-2. **Intensity decay** — regression: what is the storm's wind speed 24 h and 48 h after the reference time?
+1. **Landfall impact** — binary classification: will this storm make landfall? (`feature_matrix_landfall.csv`)
+2. **Intensity decay** — regression: wind speed 24 h and 48 h after reference time (`feature_matrix_decay.csv`)
 
-The pipeline runs from raw TCND tabular tracks through feature engineering, ablation-guided feature selection, and neural operator training.
+Each task has its own model. The decay model optionally ingests a learned embedding from the frozen landfall model, injected via FiLM conditioning at UFNO blocks 3–5 — so landfall information shapes the spatial field rather than just being another input feature.
 
 ---
 
@@ -29,30 +29,26 @@ The pipeline runs from raw TCND tabular tracks through feature engineering, abla
 
 TCND original train/val/test splits are respected throughout — no random re-splitting — to prevent temporal leakage.
 
-Raw data lives in `data/raw/_tmp/Data1D/<basin>/<split>/`.
+Raw data: `data/raw/_tmp/Data1D/<basin>/<split>/`
 
 ---
 
-## Pipeline
+## Scripts
 
-```
-scripts/load_tcnd.py      # TCND Data_1d loader (shared utility)
-       ↓
-scripts/features.py       # Feature engineering → data/features/feature_matrix_*.csv
-       ↓
-scripts/ablation.py       # Ablation study → ranks feature groups by R²
-                          # writes data/features/selected_feature_groups.json
-       ↓
-scripts/explain.py        # SHAP + LIME feature importance (optional)
-       ↓
-scripts/train_ufno.py     # Train CycloneUFNO; reads TAB_COLS from ablation output
-       ↓
-scripts/view_results.py   # 8-panel results dashboard
-       ↓
-scripts/log_experiment.py # Log results to experiments/
-
-scripts/cross_basin.py    # Cross-basin generalization experiments (independent)
-```
+| Script | Purpose |
+|---|---|
+| `scripts/load_tcnd.py` | Shared TCND Data_1d loader |
+| `scripts/features.py` | Feature engineering from Data_1d |
+| `scripts/features_improved.py` | Extended features: Data_3d (pressure drop, wind shear, SST), Env-Data, improved land-sea |
+| `scripts/ablation.py` | Ablation study — ranks feature groups by R², writes `selected_feature_groups.json` |
+| `scripts/explain.py` | SHAP + LIME feature importance (optional) |
+| `scripts/ufno.py` | CycloneUFNO model architecture |
+| `scripts/train_ufno.py` | Training — landfall and decay tasks |
+| `scripts/view_results.py` | 8-panel results dashboard |
+| `scripts/log_experiment.py` | Log experiment results to `experiments/` |
+| `scripts/cross_basin.py` | Cross-basin generalization experiments |
+| `scripts/download_data.py` | TCND data downloader |
+| `scripts/preprocess.py` | Preprocessing for spatial (Data_3d) mode |
 
 ---
 
@@ -64,14 +60,18 @@ Based on **Gege Wen et al. 2022** ([github.com/gegewen/ufno](https://github.com/
 |---|---|
 | SpectralConv2d | 2D FFT over H×W; 4-quadrant complex weights |
 | UNet2d | 3-level encoder-decoder with skip connections |
-| FiLM | Tabular features → per-channel scale + shift at every block |
-| CycloneUFNOStack | 6 UFNO blocks; UNet applied at blocks 3, 4, 5 |
+| FiLM (tabular) | Tabular features → scale + shift at every block |
+| FiLM (landfall) | Landfall embedding → scale + shift at blocks 3–5 only |
+| CycloneUFNOStack | 6 UFNO blocks; UNet at blocks 3, 4, 5 |
 | Parameters | ~11 M |
-| Output | (B, 2) → [wind_24h, wind_48h] |
 
-The model supports two input modes:
-- **Spatial** — 3D patch tensors + tabular features (requires `data/processed/`)
-- **Tabular-only** — tabular features projected to a 16×16 pseudo-grid (auto-detected fallback)
+**Task outputs:**
+- Landfall: `(B, 1)` logit — apply sigmoid for P(landfall)
+- Decay: `(B, 2)` → `[wind_24h, wind_48h]`
+
+**Input modes:**
+- Spatial — 3D patch tensors + tabular (requires `data/processed/`)
+- Tabular-only — tabular features projected to 16×16 pseudo-grid (auto-detected fallback)
 
 Device priority: CUDA → MPS (Apple Silicon) → CPU.
 
@@ -79,7 +79,7 @@ Device priority: CUDA → MPS (Apple Silicon) → CPU.
 
 ## Feature Engineering
 
-Features are computed from the 48-hour track window before the reference time.
+Features computed from the 48-hour track window before the reference time.
 
 | Group | Features | Ablation R² (24h) |
 |---|---|---|
@@ -91,7 +91,7 @@ Features are computed from the 48-hour track window before the reference time.
 
 **Selected groups (ablation-driven):** `wp_couple`, `wind`, `pressure` — 17 features total.
 
-Running `ablation.py` automatically updates `data/features/selected_feature_groups.json`, which `train_ufno.py` reads at startup to set `TAB_COLS`.
+`ablation.py` automatically updates `data/features/selected_feature_groups.json`, which `train_ufno.py` reads at startup.
 
 ---
 
@@ -100,59 +100,69 @@ Running `ablation.py` automatically updates `data/features/selected_feature_grou
 ### 1. Build features
 ```bash
 python scripts/features.py
+# or, for extended 3D/env features:
+python scripts/features_improved.py
 ```
 
-### 2. Run ablation (updates feature selection automatically)
+### 2. Run ablation (auto-updates feature selection)
 ```bash
 python scripts/ablation.py
 ```
 
-### 3. Train the model
+### 3. Train — two-stage
+
+**Step 1: landfall model**
 ```bash
-python scripts/train_ufno.py --epochs 100 --batch 8 --lr 1e-3
+python scripts/train_ufno.py --task landfall --epochs 100
+```
+
+**Step 2: decay model with landfall embedding**
+```bash
+python scripts/train_ufno.py --task decay --epochs 150 \
+    --landfall-ckpt models/best_ufno_landfall.pt
+```
+
+Or without landfall embedding:
+```bash
+python scripts/train_ufno.py --task decay --epochs 150
 ```
 
 Options:
 ```
---epochs   int    Training epochs            (default 100)
---batch    int    Batch size                 (default 8)
---lr       float  Initial learning rate      (default 1e-3)
---modes    int    Fourier modes              (default 12)
---width    int    UFNO hidden width          (default 32)
---unet-dropout float  Dropout in UNet branches    (default 0.2)
---no-tab              Disable tabular FiLM conditioning
---seed         int    Random seed                (default 42)
+--task          {landfall,decay}  Task to train             (default decay)
+--landfall-ckpt PATH              Landfall checkpoint for embedding injection
+--epochs        int               Training epochs           (default 100)
+--batch         int               Batch size                (default 8)
+--lr            float             Initial learning rate     (default 1e-3)
+--modes         int               Fourier modes             (default 12)
+--width         int               UFNO hidden width         (default 32)
+--unet-dropout  float             UNet dropout              (default 0.2)
+--seed          int               Random seed               (default 42)
 ```
 
 ### 4. View results
 ```bash
-python scripts/view_results.py
+python scripts/view_results.py --show
 ```
 Saves an 8-panel dashboard to `figures/ufno_results/dashboard.png`.
 
-### 5. Feature importance (optional)
+### 5. Log the experiment
+```bash
+python scripts/log_experiment.py \
+  --name "Two-stage: landfall embedding in decay model" \
+  --notes "What you observed"
+```
+
+### 6. Feature importance (optional)
 ```bash
 python scripts/explain.py
 ```
-Produces SHAP beeswarm/bar plots and LIME local explanations in `figures/`.
-
-### 6. Log the experiment
-```bash
-python scripts/log_experiment.py \
-  --name "Short description" \
-  --notes "What you observed"
-```
-Auto-reads the checkpoint, training history, and predictions. Saves a numbered record to `experiments/`.
 
 ### 7. Cross-basin generalization (optional)
 ```bash
 python scripts/cross_basin.py --epochs 60
 ```
-Trains separate models per basin and tests transfer. Produces:
-- `data/features/cross_basin_results.csv`
-- `figures/cross_basin_heatmap.png` — transfer RMSE matrix
-- `figures/cross_basin_gradual.png` — effect of adding more basins
-- `figures/cross_basin_summary.png` — in-domain vs transfer vs all-basin
+Produces transfer RMSE heatmap, gradual basin addition curves, and in-domain vs transfer comparison.
 
 ---
 
@@ -160,23 +170,19 @@ Trains separate models per basin and tests transfer. Produces:
 
 | Path | Contents |
 |---|---|
-| `data/features/feature_matrix_decay.csv` | 933 × 35 feature matrix for decay task |
-| `data/features/feature_matrix_landfall.csv` | 2389 × 30 feature matrix for landfall task |
+| `data/features/feature_matrix_decay.csv` | 933 × 35 feature matrix — decay task |
+| `data/features/feature_matrix_landfall.csv` | 2389 × 30 feature matrix — landfall task |
 | `data/features/feature_groups.json` | Feature group definitions |
 | `data/features/selected_feature_groups.json` | Ablation-selected groups (auto-updated) |
-| `data/features/ablation_decay_24h.csv` | Ablation results for 24h decay |
-| `data/features/ablation_decay_48h.csv` | Ablation results for 48h decay |
-| `data/features/ablation_landfall.csv` | Ablation results for landfall prediction |
-| `models/best_ufno.pt` | Best validation checkpoint |
-| `models/last_ufno.pt` | Final epoch checkpoint |
+| `data/features/ablation_*.csv` | Ablation results per task |
+| `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
+| `models/best_ufno_landfall.pt` | Best landfall model checkpoint |
+| `models/best_ufno_decay.pt` | Best decay model checkpoint |
 | `models/ufno_history.json` | Per-epoch loss and MAE log |
 | `figures/ufno_results/dashboard.png` | 8-panel results dashboard |
 | `figures/ufno_results/predictions.csv` | Test-set predictions with errors |
-| `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
-| `figures/cross_basin_heatmap.png` | Transfer RMSE heatmap |
-| `figures/cross_basin_gradual.png` | Gradual basin addition curves |
-| `figures/cross_basin_summary.png` | In-domain vs transfer vs all-basin comparison |
-| `experiments/exp_NNN_*.json` | Per-experiment logs (hyperparams, metrics, notes) |
+| `figures/cross_basin_*.png` | Cross-basin experiment figures |
+| `experiments/exp_NNN_*.json` | Per-experiment logs |
 
 ---
 
@@ -194,7 +200,6 @@ matplotlib
 lime          # optional — LIME explanations skipped if not installed
 ```
 
-Install:
 ```bash
 pip install torch numpy pandas scikit-learn xgboost shap tqdm matplotlib
 ```
