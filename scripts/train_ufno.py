@@ -243,12 +243,69 @@ def _collate_spatial(batch):
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-def load_data(seed: int):
-    """Return (train_loader, val_loader, test_loader, meta, mode, tab_dim)."""
+def _split_df(df, seed):
+    """Apply TCND original splits if available, else random 70/15/15."""
+    if "split" in df.columns and df["split"].isin(["train","val","test"]).any():
+        train_df = df[df["split"] == "train"].reset_index(drop=True)
+        val_df   = df[df["split"] == "val"].reset_index(drop=True)
+        test_df  = df[df["split"] == "test"].reset_index(drop=True)
+        print(f"Split      : TCND original  "
+              f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
+    else:
+        train_df, tmp_df = train_test_split(df, test_size=0.3, random_state=seed)
+        val_df,  test_df = train_test_split(tmp_df, test_size=0.5, random_state=seed)
+        print(f"Split      : random 70/15/15  "
+              f"(train={len(train_df)}, val={len(val_df)}, test={len(test_df)})")
+    return train_df, val_df, test_df
+
+
+def load_data(seed: int, task: str = "decay", batch: int = 8):
+    """Return (train_loader, val_loader, test_loader, meta, tgt_scaler)."""
+
+    if task == "landfall":
+        csv = os.path.join(FEAT_DIR, "feature_matrix_landfall.csv")
+        if not os.path.exists(csv):
+            raise FileNotFoundError("Run features.py first — feature_matrix_landfall.csv not found.")
+        df = pd.read_csv(csv, keep_default_na=False)
+        df = df.dropna(subset=[LANDFALL_TARGET]).reset_index(drop=True)
+        print(f"Task       : landfall (binary classification)")
+        print(f"Samples    : {len(df)}  |  basins: {df['basin'].value_counts().to_dict()}")
+        print(f"Landfall % : {df[LANDFALL_TARGET].mean()*100:.1f}%")
+
+        tab_scaler = StandardScaler()
+        train_df, val_df, test_df = _split_df(df, seed)
+
+        train_ds = LandfallDataset(train_df, tab_scaler, fit=True)
+        val_ds   = LandfallDataset(val_df,   tab_scaler, fit=False)
+        test_ds  = LandfallDataset(test_df,  tab_scaler, fit=False)
+
+        # Class-balanced sampler for imbalanced landfall labels
+        pos_weight = (train_df[LANDFALL_TARGET] == 0).sum() / \
+                     max((train_df[LANDFALL_TARGET] == 1).sum(), 1)
+        weights = train_df[LANDFALL_TARGET].map(
+            lambda y: float(pos_weight) if y == 1 else 1.0).values
+        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+
+        tab_cols = [c for c in TAB_COLS if c in df.columns]
+        meta = {
+            "task":    "landfall",
+            "mode":    "tabular",
+            "tab_dim": len(tab_cols),
+            "tab_cols": tab_cols,
+            "n_train": len(train_ds),
+            "n_val":   len(val_ds),
+            "n_test":  len(test_ds),
+        }
+        kw = dict(batch_size=batch, num_workers=0)
+        return (DataLoader(train_ds, sampler=sampler, **kw),
+                DataLoader(val_ds,   shuffle=False,   **kw),
+                DataLoader(test_ds,  shuffle=False,   **kw),
+                meta, None)
+
+    # ── decay task ────────────────────────────────────────────────────────────
     samples_csv = os.path.join(PROC_DIR, "samples.csv")
     decay_csv   = os.path.join(FEAT_DIR,  "feature_matrix_decay.csv")
 
-    # Prefer processed tensors; fall back to feature matrix
     if os.path.exists(samples_csv):
         mode = "spatial"
         df   = pd.read_csv(samples_csv, keep_default_na=False)
@@ -364,12 +421,12 @@ def load_data(seed: int, task: str = "decay", batch: int = 8,
     val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
     test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
 
-    # Basin-weighted sampler: inverse-frequency weighting so EP is oversampled
-    basin_counts = train_df["basin"].value_counts().to_dict()
+    # Basin-weighted sampler: oversample EP
+    basin_counts   = train_df["basin"].value_counts().to_dict()
     sample_weights = train_df["basin"].map(
         lambda b: 1.0 / basin_counts.get(b, 1)).values
-    sampler = WeightedRandomSampler(
-        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights),
+                                    replacement=True)
 
     kw = dict(batch_size=8, num_workers=0, collate_fn=collate)
     train_loader = DataLoader(train_ds, sampler=sampler, **kw)
@@ -568,6 +625,8 @@ def main():
         modes2       = args.modes,
         width        = args.width,
         unet_dropout = args.unet_dropout,
+        n_outputs    = n_outputs,
+        lf_embed_dim = lf_embed_dim,
     ).to(DEVICE)
 
     print(f"\nTask       : {task}")
@@ -575,7 +634,13 @@ def main():
     print(f"Device     : {DEVICE}")
     print(f"Epochs     : {args.epochs}")
 
-    criterion = LpLoss(p=2)
+    # ── Loss ───────────────────────────────────────────────────────────────
+    if task == "landfall":
+        # Class imbalance: weight positive class
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = LpLoss(p=2)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -606,8 +671,8 @@ def main():
             model, train_loader, mode, DEVICE, optimizer, criterion,
             desc=f"Ep {epoch:>3} train", show_bar=True, lf_model=lf_model)
         vl_loss, vl_mae = run_epoch(
-            model, val_loader, mode, DEVICE,
-            desc=f"Ep {epoch:>3} val  ", show_bar=True)
+            model, val_loader, mode, DEVICE, criterion=criterion,
+            desc=f"Ep {epoch:>3} val  ", show_bar=True, lf_model=lf_model)
         scheduler.step(vl_loss)
 
         history["train_loss"].append(tr_loss)
