@@ -138,7 +138,7 @@ class LandfallDataset(Dataset):
         # hours_to_landfall = hours_remaining in track (always positive)
         df = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
         tab_cols = [c for c in TAB_COLS if c in df.columns]
-        X = df[tab_cols].fillna(0).values.astype(np.float32)
+        X = df[tab_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
         y = df[[LANDFALL_TARGET]].values.astype(np.float32)   # (N,1)
 
         if fit:
