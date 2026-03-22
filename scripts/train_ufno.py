@@ -3,8 +3,9 @@ Train CycloneUFNO — landfall impact or intensity decay.
 
 Two tasks
 ─────────
-  landfall  — binary classification: will this storm make landfall?
-               Uses feature_matrix_landfall.csv, BCEWithLogitsLoss
+  landfall  — regression: hours until landfall (hours_to_landfall)
+               Uses feature_matrix_landfall.csv, LpLoss
+               Non-landfall storms have hours_to_landfall = -1 (sentinel)
                Saves: best_ufno_landfall.pt
 
   decay     — regression: wind speed 24h and 48h after reference time
@@ -118,22 +119,37 @@ def _load_tab_cols() -> list:
 
 TAB_COLS    = _load_tab_cols()
 TARGET_COLS = ["wind_24h", "wind_48h"]
-LANDFALL_TARGET = "made_landfall"
+LANDFALL_TARGET = "hours_to_landfall"
 
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
 class LandfallDataset(Dataset):
-    """Tabular dataset for landfall binary classification."""
+    """
+    Tabular dataset for landfall timing regression.
+
+    Target: hours_to_landfall (positive = hours until landfall event,
+            -1.0 = sentinel for storms that never make landfall).
+    """
 
     def __init__(self, df: pd.DataFrame,
                  tab_scaler: StandardScaler,
+                 tgt_scaler: StandardScaler,
                  fit: bool = False):
+        # hours_to_landfall = hours_remaining in track (always positive)
+        df = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
         tab_cols = [c for c in TAB_COLS if c in df.columns]
         X = df[tab_cols].fillna(0).values.astype(np.float32)
-        y = df[LANDFALL_TARGET].values.astype(np.float32)
-        self.X = torch.tensor(tab_scaler.fit_transform(X) if fit
-                              else tab_scaler.transform(X), dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N,1)
+        y = df[[LANDFALL_TARGET]].values.astype(np.float32)   # (N,1)
+
+        if fit:
+            X = tab_scaler.fit_transform(X)
+            y = tgt_scaler.fit_transform(y)
+        else:
+            X = tab_scaler.transform(X)
+            y = tgt_scaler.transform(y)
+
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
         self.meta = df[["storm_id", "basin"]].reset_index(drop=True)
 
     def __len__(self):  return len(self.X)
@@ -242,55 +258,62 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
             raise FileNotFoundError("Run features.py first — feature_matrix_landfall.csv not found.")
         df = pd.read_csv(csv, keep_default_na=False)
         df = df.dropna(subset=[LANDFALL_TARGET]).reset_index(drop=True)
-        print(f"Task       : landfall (binary classification)")
-        print(f"Samples    : {len(df)}  |  basins: {df['basin'].value_counts().to_dict()}")
-        print(f"Landfall % : {df[LANDFALL_TARGET].mean()*100:.1f}%")
+        # hours_to_landfall = hours remaining in track (always positive)
+        df_lf = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
+        print(f"Task       : landfall (hours_to_landfall regression)")
+        print(f"Total rows : {len(df)}  |  landfall rows: {len(df_lf)}")
+        print(f"Basins     : {df_lf['basin'].value_counts().to_dict()}")
+        print(f"hrs range  : [{df_lf[LANDFALL_TARGET].min():.0f}, "
+              f"{df_lf[LANDFALL_TARGET].max():.0f}] h")
 
         tab_scaler = StandardScaler()
-        train_df, val_df, test_df = _split_df(df, seed)
+        tgt_scaler = StandardScaler()
+        train_df, val_df, test_df = _split_df(df_lf, seed)
 
-        train_ds = LandfallDataset(train_df, tab_scaler, fit=True)
-        val_ds   = LandfallDataset(val_df,   tab_scaler, fit=False)
-        test_ds  = LandfallDataset(test_df,  tab_scaler, fit=False)
+        train_ds = LandfallDataset(train_df, tab_scaler, tgt_scaler, fit=True)
+        val_ds   = LandfallDataset(val_df,   tab_scaler, tgt_scaler, fit=False)
+        test_ds  = LandfallDataset(test_df,  tab_scaler, tgt_scaler, fit=False)
 
-        # Class-balanced sampler for imbalanced landfall labels
-        pos_weight = (train_df[LANDFALL_TARGET] == 0).sum() / \
-                     max((train_df[LANDFALL_TARGET] == 1).sum(), 1)
-        weights = train_df[LANDFALL_TARGET].map(
-            lambda y: float(pos_weight) if y == 1 else 1.0).values
-        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+        # Basin-weighted sampler to handle EP under-representation
+        basin_counts   = train_df["basin"].value_counts().to_dict()
+        sample_weights = train_df["basin"].map(
+            lambda b: 1.0 / basin_counts.get(b, 1)).values
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights),
+                                        replacement=True)
 
         tab_cols = [c for c in TAB_COLS if c in df.columns]
         meta = {
-            "task":    "landfall",
-            "mode":    "tabular",
-            "tab_dim": len(tab_cols),
-            "tab_cols": tab_cols,
-            "n_train": len(train_ds),
-            "n_val":   len(val_ds),
-            "n_test":  len(test_ds),
+            "task":      "landfall",
+            "mode":      "tabular",
+            "tab_dim":   len(tab_cols),
+            "tab_cols":  tab_cols,
+            "tgt_mean":  tgt_scaler.mean_.tolist(),
+            "tgt_scale": tgt_scaler.scale_.tolist(),
+            "n_train":   len(train_ds),
+            "n_val":     len(val_ds),
+            "n_test":    len(test_ds),
         }
         kw = dict(batch_size=batch, num_workers=0)
         return (DataLoader(train_ds, sampler=sampler, **kw),
                 DataLoader(val_ds,   shuffle=False,   **kw),
                 DataLoader(test_ds,  shuffle=False,   **kw),
-                meta, None)
+                meta, tgt_scaler)
 
     # ── decay task ────────────────────────────────────────────────────────────
-    samples_csv = os.path.join(PROC_DIR, "samples.csv")
-    decay_csv   = os.path.join(FEAT_DIR,  "feature_matrix_decay.csv")
+    decay_csv = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
+    patch_dir = os.path.join(PROC_DIR, "3d")
 
-    if os.path.exists(samples_csv):
-        mode = "spatial"
-        df   = pd.read_csv(samples_csv, keep_default_na=False)
-        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
-    elif os.path.exists(decay_csv):
-        mode = "tabular"
-        df   = pd.read_csv(decay_csv, keep_default_na=False)
-        df   = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
-    else:
+    if not os.path.exists(decay_csv):
         raise FileNotFoundError(
-            "No data found. Run features.py (tabular) or preprocess.py (spatial).")
+            "No data found. Run scripts/features.py first.")
+
+    df = pd.read_csv(decay_csv, keep_default_na=False)
+    df = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
+
+    # Spatial mode: activated when preprocess.py has written patches to 3d/
+    has_patches = (os.path.isdir(patch_dir) and
+                   any(f.endswith(".npy") for f in os.listdir(patch_dir)))
+    mode = "spatial" if has_patches else "tabular"
 
     print(f"Task       : decay (regression)")
     print(f"Data mode  : {mode}")
@@ -505,11 +528,7 @@ def main():
     print(f"Epochs     : {args.epochs}")
 
     # ── Loss ───────────────────────────────────────────────────────────────
-    if task == "landfall":
-        # Class imbalance: weight positive class
-        criterion = nn.BCEWithLogitsLoss()
-    else:
-        criterion = LpLoss(p=2)
+    criterion = LpLoss(p=2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=1e-3)
@@ -589,10 +608,13 @@ def main():
                                     criterion=criterion, lf_model=lf_model)
     print(f"\nTest loss  : {test_loss:.4f}")
     print(f"Test MAE   : {test_mae:.4f}")
-    if task == "decay" and tgt_scaler is not None:
+    if tgt_scaler is not None:
         scale = np.array(tgt_scaler.scale_)
-        print(f"Test MAE   : wind_24h ≈ {test_mae * scale[0]:.2f}  "
-              f"| wind_48h ≈ {test_mae * scale[1]:.2f}  (normalised units)")
+        if task == "decay":
+            print(f"Test MAE   : wind_24h ≈ {test_mae * scale[0]:.2f}  "
+                  f"| wind_48h ≈ {test_mae * scale[1]:.2f}  (normalised units)")
+        elif task == "landfall":
+            print(f"Test MAE   : hours_to_landfall ≈ {test_mae * scale[0]:.1f} h")
     print(f"\nCheckpoint : {MODELS_DIR}/{ckpt_name}")
     print(f"History    : {hist_path}")
 

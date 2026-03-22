@@ -1,307 +1,262 @@
 """
-Multimodal preprocessing for TCND — Data_1d, Data_3d, Env-Data.
+Extract 925 hPa boundary-layer patches from TCND Data_3d NetCDF files.
 
-Produces aligned, normalised tensors for each storm sample, ready for
-the multimodal model in model.py.
+For each storm in the decay feature matrix, reads T=8 NetCDF files ending at
+the reference time, extracts the 925 hPa level for u, v, z and the 2-D SST
+field, stacks them into a (T, 4, 81, 81) tensor, normalises per channel, and
+saves to data/processed/3d/{storm_id}.npy.
 
-Output layout  (data/processed/):
-    samples.csv          — one row per sample (storm_id, basin, landfall_time,
-                           landfall_wind, label_wind_24h, label_wind_48h)
-    1d/<id>.npy          — (T, F1) tabular sequence, T=lookback steps, F1=features
-    3d/<id>.npy          — (T, C, H, W) spatial patch sequence
-    env/<id>.npy         — (E,)  env feature vector
-    scaler_1d.pkl        — StandardScaler for Data_1d features
-    scaler_env.pkl       — StandardScaler for Env-Data features
+The saved patches are consumed by SpatialDecayDataset in train_ufno.py.
+
+Directory layout expected
+─────────────────────────
+data/raw/_tmp/Data3D/<BASIN>/<YEAR>/<STORM_NAME>/
+    TCND_<NAME>_<YYYYMMDDH0>_sst_z_u_v.nc
+
+Usage
+─────
+  python scripts/preprocess.py [--basins WP NA EP] [--lookback 8]
+
+Outputs
+───────
+  data/processed/3d/<storm_id>.npy   — (T, 4, H, W) float32
+  data/processed/3d_stats.json       — per-channel global mean/std
 """
 
+import argparse
+import json
 import os
-import glob
-import pickle
+import sys
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+
+try:
+    import xarray as xr
+except ImportError:
+    sys.exit("xarray not installed — run: pip install xarray netCDF4")
+
+# Allow importing load_tcnd from the same directory
+sys.path.insert(0, os.path.dirname(__file__))
+from load_tcnd import load_basin as _tcnd_load_basin
 
 RAW_DIR  = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 PROC_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
-BASINS   = ["WP", "NA", "EP"]
+FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
 
-# Number of 6-hour steps to look back before landfall
-LOOKBACK_STEPS = 8   # 48 hours
+# 925 hPa is index 3 in [200, 500, 850, 925]
+PRESSURE_IDX = 3
+LOOKBACK_DEFAULT = 8   # number of 6-hour steps
 
-# ── Column aliases (IBTrACS varies across versions) ───────────────────────────
-COL_MAP = {
-    "storm_id": ["SID", "storm_id", "ID"],
-    "time":     ["ISO_TIME", "time", "TIME", "datetime"],
-    "lat":      ["LAT", "lat", "CLAT", "USA_LAT"],
-    "lon":      ["LON", "lon", "CLON", "USA_LON"],
-    "wind":     ["WMO_WIND", "wind", "USA_WIND", "VMAX"],
-    "pressure": ["WMO_PRES", "pressure", "USA_PRES", "MSLP"],
-}
-
-def _col(df, key):
-    for c in COL_MAP[key]:
-        if c in df.columns:
-            return c
-    raise KeyError(f"Column not found for '{key}' among {list(df.columns)}")
+os.makedirs(os.path.join(PROC_DIR, "3d"), exist_ok=True)
 
 
-# ── Land mask (lightweight) ───────────────────────────────────────────────────
-_LAND_BOXES = [
-    (-35,  75,  -25,  60),
-    ( 10,  75, -170, -50),
-    (-55,  15,  -85, -30),
-    (-10,  55,   60, 150),
-    (-45, -10,  110, 155),
-    (  5,  30,   70, 105),
-    ( 30,  75,   10,  60),
-]
-
-def _over_land(lat, lon):
-    lon = ((lon + 180) % 360) - 180
-    return any(r[0] <= lat <= r[1] and r[2] <= lon <= r[3] for r in _LAND_BOXES)
-
-
-# ── 1. Load Data_1d ───────────────────────────────────────────────────────────
-def load_1d(basin: str) -> pd.DataFrame:
-    pattern = os.path.join(RAW_DIR, "Data_1d", basin, "**", "*.csv")
-    files = glob.glob(pattern, recursive=True)
-    if not files:
-        raise FileNotFoundError(f"No Data_1d CSVs for {basin}")
-
-    frames = []
-    for f in files:
-        df = pd.read_csv(f, low_memory=False, skiprows=lambda i: i == 1)
-        frames.append(df)
-    data = pd.concat(frames, ignore_index=True)
-
-    data = data.rename(columns={
-        _col(data, "storm_id"): "storm_id",
-        _col(data, "time"):     "time",
-        _col(data, "lat"):      "lat",
-        _col(data, "lon"):      "lon",
-        _col(data, "wind"):     "wind",
-        _col(data, "pressure"): "pressure",
-    })
-    data["time"]     = pd.to_datetime(data["time"], errors="coerce")
-    data["lat"]      = pd.to_numeric(data["lat"],      errors="coerce")
-    data["lon"]      = pd.to_numeric(data["lon"],      errors="coerce")
-    data["wind"]     = pd.to_numeric(data["wind"],     errors="coerce")
-    data["pressure"] = pd.to_numeric(data["pressure"], errors="coerce")
-    data["basin"]    = basin
-    return data.dropna(subset=["storm_id","time","lat","lon"]).sort_values(
-        ["storm_id","time"]).reset_index(drop=True)
-
-
-# ── 2. Detect landfall events ─────────────────────────────────────────────────
-def detect_landfalls(data: pd.DataFrame) -> pd.DataFrame:
-    data["over_land"] = data.apply(lambda r: _over_land(r["lat"], r["lon"]), axis=1)
-    events = []
-    for sid, grp in data.groupby("storm_id"):
-        grp = grp.sort_values("time").reset_index(drop=True)
-        for i in range(1, len(grp)):
-            if not grp.loc[i-1, "over_land"] and grp.loc[i, "over_land"]:
-                events.append({
-                    "storm_id":      sid,
-                    "basin":         grp.loc[i, "basin"],
-                    "landfall_time": grp.loc[i, "time"],
-                    "landfall_wind": grp.loc[i, "wind"],
-                    "landfall_pres": grp.loc[i, "pressure"],
-                    "landfall_lat":  grp.loc[i, "lat"],
-                    "landfall_lon":  grp.loc[i, "lon"],
-                })
-                break
-    return pd.DataFrame(events)
-
-
-# ── 3. Build labelled samples ─────────────────────────────────────────────────
-def build_samples(data: pd.DataFrame, landfalls: pd.DataFrame) -> pd.DataFrame:
-    """Add regression targets: wind 24 h and 48 h post-landfall."""
-    rows = []
-    for _, lf in landfalls.iterrows():
-        sid = lf["storm_id"]
-        t0  = lf["landfall_time"]
-        track = data[data["storm_id"] == sid].set_index("time")["wind"]
-
-        def _wind_at(hours):
-            t = t0 + pd.Timedelta(hours=hours)
-            nearest = track.index[abs(track.index - t).argmin()]
-            if abs(nearest - t) <= pd.Timedelta(hours=4):
-                return track[nearest]
-            return np.nan
-
-        rows.append({**lf.to_dict(),
-                     "label_wind_24h": _wind_at(24),
-                     "label_wind_48h": _wind_at(48)})
-    return pd.DataFrame(rows).dropna(subset=["label_wind_24h","label_wind_48h"])
-
-
-# ── 4. Extract Data_1d lookback sequence ─────────────────────────────────────
-_1D_FEATURES = ["lat", "lon", "wind", "pressure"]
-
-def extract_1d_sequence(data: pd.DataFrame, sid: str, t_landfall: pd.Timestamp) -> np.ndarray:
-    """Return (LOOKBACK_STEPS, F1) array of tabular features before landfall."""
-    track = data[data["storm_id"] == sid].sort_values("time")
-    track = track[track["time"] <= t_landfall].tail(LOOKBACK_STEPS)
-    arr = track[_1D_FEATURES].values.astype(np.float32)
-    # Pad with the earliest row if not enough history
-    if len(arr) < LOOKBACK_STEPS:
-        pad = np.repeat(arr[:1], LOOKBACK_STEPS - len(arr), axis=0)
-        arr = np.vstack([pad, arr])
-    return arr   # (LOOKBACK_STEPS, 4)
-
-
-# ── 5. Load Data_3d patch ─────────────────────────────────────────────────────
-def load_3d_patch(basin: str, sid: str, t_landfall: pd.Timestamp) -> np.ndarray | None:
+# ── Filename → datetime ────────────────────────────────────────────────────────
+def _fname_to_dt(fname: str) -> datetime | None:
     """
-    Load the 3D spatial patch closest to landfall time.
-    Expected file layout: Data_3d/<BASIN>/<storm_id>/<timestamp>.npy  OR
-                          Data_3d/<BASIN>/<storm_id>.npy  (single array)
-    Returns (T, C, H, W) or None if not found.
+    Parse the datetime stamp embedded in a TCND filename.
+    e.g. 'TCND_ALETTA_1988061618_sst_z_u_v.nc'  →  datetime(1988, 6, 16, 18)
     """
-    base = os.path.join(RAW_DIR, "Data_3d", basin)
-
-    # Try per-storm directory
-    storm_dir = os.path.join(base, sid)
-    if os.path.isdir(storm_dir):
-        files = sorted(glob.glob(os.path.join(storm_dir, "*.npy")))
-        if files:
-            # Pick the LOOKBACK_STEPS files ending at landfall
-            patches = [np.load(f) for f in files[-LOOKBACK_STEPS:]]
-            arr = np.stack(patches, axis=0).astype(np.float32)  # (T, C, H, W)
-            return arr
-
-    # Try single .npy per storm
-    npy_file = os.path.join(base, f"{sid}.npy")
-    if os.path.exists(npy_file):
-        arr = np.load(npy_file).astype(np.float32)
-        if arr.ndim == 3:          # (C, H, W) — single snapshot
-            arr = arr[np.newaxis]  # -> (1, C, H, W)
-        return arr[-LOOKBACK_STEPS:]
-
+    base = os.path.basename(fname)
+    parts = base.split("_")
+    # Find the part that looks like a 10-digit timestamp
+    for p in parts:
+        if len(p) == 10 and p.isdigit():
+            try:
+                return datetime.strptime(p, "%Y%m%d%H")
+            except ValueError:
+                pass
     return None
 
 
-# ── 6. Load Env-Data vector ───────────────────────────────────────────────────
-def load_env_features(basin: str, sid: str) -> np.ndarray | None:
+# ── Build a storm → Data_3d directory mapping for one basin ───────────────────
+def _build_storm_dir_map(basin: str) -> dict[str, str]:
     """
-    Load pre-calculated environmental feature vector for a storm.
-    Expected layout: Env-Data/<BASIN>/<storm_id>.npy  or a master CSV.
+    Returns {storm_id: abs_path_to_storm_dir} for every storm found under
+    data/raw/_tmp/Data3D/<BASIN>/
     """
-    npy_file = os.path.join(RAW_DIR, "Env-Data", basin, f"{sid}.npy")
-    if os.path.exists(npy_file):
-        return np.load(npy_file).astype(np.float32)
+    base = os.path.join(RAW_DIR, "_tmp", "Data3D", basin)
+    if not os.path.isdir(base):
+        return {}
 
-    # Fallback: look for a CSV where rows are storms
-    csv_files = glob.glob(os.path.join(RAW_DIR, "Env-Data", basin, "**", "*.csv"), recursive=True)
-    for f in csv_files:
-        df = pd.read_csv(f, index_col=0)
-        if sid in df.index:
-            return df.loc[sid].values.astype(np.float32)
+    mapping = {}
+    # Load Data_1d to get (year, name) → storm_id correspondence
+    try:
+        df = _tcnd_load_basin(basin)
+    except FileNotFoundError:
+        return {}
 
-    return None
+    # Extract year from storm_id (e.g. 'EP1988BSTGILMA' → '1988')
+    df = df.drop_duplicates("storm_id").copy()
+    df["year"] = df["storm_id"].str[len(basin):len(basin) + 4]
+    year_name_to_id: dict[tuple[str, str], str] = {
+        (row["year"], row["name"]): row["storm_id"]
+        for _, row in df.iterrows()
+    }
+
+    for year in os.listdir(base):
+        year_dir = os.path.join(base, year)
+        if not os.path.isdir(year_dir):
+            continue
+        for storm_name in os.listdir(year_dir):
+            storm_dir = os.path.join(year_dir, storm_name)
+            if not os.path.isdir(storm_dir):
+                continue
+            sid = year_name_to_id.get((year, storm_name))
+            if sid is not None:
+                mapping[sid] = storm_dir
+
+    return mapping
 
 
-# ── 7. Fit scalers & serialise ────────────────────────────────────────────────
-def fit_and_save_scalers(all_1d: list[np.ndarray], all_env: list[np.ndarray]):
-    sc1d = StandardScaler()
-    sc1d.fit(np.vstack(all_1d).reshape(-1, len(_1D_FEATURES)))
-    with open(os.path.join(PROC_DIR, "scaler_1d.pkl"), "wb") as f:
-        pickle.dump(sc1d, f)
+# ── Load one 925 hPa snapshot from a single NetCDF file ───────────────────────
+def _load_snapshot(nc_path: str) -> np.ndarray | None:
+    """
+    Returns (4, 81, 81) float32: [u925, v925, z925, sst].
+    Returns None on failure.
+    """
+    try:
+        ds = xr.open_dataset(nc_path)
+        u   = ds["u"].values[0, PRESSURE_IDX, :, :]    # (81, 81)
+        v   = ds["v"].values[0, PRESSURE_IDX, :, :]
+        z   = ds["z"].values[0, PRESSURE_IDX, :, :]
+        sst = ds["sst"].values                          # (81, 81)
+        ds.close()
+        out = np.stack([u, v, z, sst], axis=0).astype(np.float32)  # (4, 81, 81)
+        return out
+    except Exception as e:
+        print(f"    [warn] failed to read {nc_path}: {e}")
+        return None
 
-    if all_env:
-        scenv = StandardScaler()
-        scenv.fit(np.vstack(all_env))
-        with open(os.path.join(PROC_DIR, "scaler_env.pkl"), "wb") as f:
-            pickle.dump(scenv, f)
-        return sc1d, scenv
-    return sc1d, None
 
+# ── Build (T, 4, 81, 81) patch for one storm ──────────────────────────────────
+def _build_patch(storm_dir: str,
+                 ref_time: pd.Timestamp,
+                 lookback: int) -> np.ndarray | None:
+    """
+    Collect the `lookback` 6-hourly snapshots ending at ref_time.
+    Returns (T, 4, 81, 81) float32 or None if insufficient files found.
+    """
+    # Index all files in the storm directory by their datetime
+    nc_files = sorted(f for f in os.listdir(storm_dir) if f.endswith(".nc"))
+    dt_map: dict[pd.Timestamp, str] = {}
+    for f in nc_files:
+        dt = _fname_to_dt(f)
+        if dt is not None:
+            ts = pd.Timestamp(dt)
+            dt_map[ts] = os.path.join(storm_dir, f)
 
-def apply_scaler_1d(sc, arr: np.ndarray) -> np.ndarray:
-    T, F = arr.shape
-    return sc.transform(arr.reshape(-1, F)).reshape(T, F)
+    if not dt_map:
+        return None
+
+    # Select up to `lookback` timesteps ending at ref_time
+    available = sorted(t for t in dt_map if t <= ref_time)
+    selected  = available[-lookback:]
+    if not selected:
+        return None
+
+    snapshots = []
+    for ts in selected:
+        snap = _load_snapshot(dt_map[ts])
+        if snap is None:
+            return None
+        snapshots.append(snap)
+
+    patch = np.stack(snapshots, axis=0)   # (T, 4, 81, 81)
+    # Pad with earliest snapshot if fewer than lookback steps available
+    if len(snapshots) < lookback:
+        pad_count = lookback - len(snapshots)
+        pad = np.repeat(snapshots[0:1], pad_count, axis=0)
+        patch = np.concatenate([pad, patch], axis=0)
+
+    return patch
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-def run():
-    for d in ["1d", "3d", "env"]:
-        os.makedirs(os.path.join(PROC_DIR, d), exist_ok=True)
+def run(basins: list[str], lookback: int):
+    # Load decay feature matrix to know which storms/ref_times are needed
+    decay_path = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
+    if not os.path.exists(decay_path):
+        sys.exit(f"Feature matrix not found: {decay_path}\n"
+                 "Run scripts/features.py first.")
 
-    all_samples = []
-    raw_1d_seqs, raw_env_vecs = [], []
+    df = pd.read_csv(decay_path, parse_dates=["ref_time"])
+    df = df[df["basin"].isin(basins)]
+    print(f"Decay samples: {len(df)} across basins {basins}")
 
-    # Pass 1: load data and collect raw arrays for scaler fitting
-    basin_data, basin_lf = {}, {}
-    for basin in BASINS:
-        print(f"\nLoading {basin} Data_1d...")
-        try:
-            data = load_1d(basin)
-        except FileNotFoundError as e:
-            print(f"  SKIP — {e}")
-            continue
+    all_patches: list[np.ndarray] = []   # for global normalisation
+    patch_map:   dict[str, str]   = {}   # storm_id → saved .npy path
 
-        lf = detect_landfalls(data)
-        samples = build_samples(data, lf)
-        basin_data[basin] = data
-        basin_lf[basin]   = samples
-        print(f"  {len(samples)} labelled samples")
+    skipped = 0
+    for basin in basins:
+        print(f"\n── {basin} ─────────────────────────────────────")
+        dir_map = _build_storm_dir_map(basin)
+        print(f"  Data_3d storms found: {len(dir_map)}")
 
-        for _, row in samples.iterrows():
-            seq = extract_1d_sequence(data, row["storm_id"], row["landfall_time"])
-            raw_1d_seqs.append(seq)
+        basin_df = df[df["basin"] == basin].drop_duplicates("storm_id")
 
-            env = load_env_features(basin, row["storm_id"])
-            if env is not None:
-                raw_env_vecs.append(env)
+        for _, row in basin_df.iterrows():
+            sid      = row["storm_id"]
+            ref_time = pd.Timestamp(row["ref_time"])
 
-    if not raw_1d_seqs:
-        print("\nNo samples found. Run download_data.py first.")
+            storm_dir = dir_map.get(sid)
+            if storm_dir is None:
+                skipped += 1
+                continue
+
+            patch = _build_patch(storm_dir, ref_time, lookback)
+            if patch is None:
+                print(f"  [skip] {sid} — patch build failed")
+                skipped += 1
+                continue
+
+            out_path = os.path.join(PROC_DIR, "3d", f"{sid}.npy")
+            np.save(out_path, patch)
+            all_patches.append(patch)
+            patch_map[sid] = out_path
+
+        print(f"  Saved: {len(patch_map)}  Skipped: {skipped}")
+
+    if not all_patches:
+        print("\nNo patches extracted. Check Data_3d path and feature matrix.")
         return
 
-    print("\nFitting scalers...")
-    sc1d, scenv = fit_and_save_scalers(raw_1d_seqs, raw_env_vecs)
+    # ── Global per-channel normalisation ──────────────────────────────────────
+    print("\nComputing global channel statistics …")
+    stack = np.concatenate(all_patches, axis=0)  # (N*T, 4, H, W)
+    stats = {}
+    for c in range(stack.shape[1]):
+        ch = stack[:, c, :, :].reshape(-1).astype(np.float64)  # float64 avoids overflow
+        ch = ch[np.isfinite(ch)]
+        mean, std = float(np.mean(ch)), float(np.std(ch))
+        std = max(std, 1e-6)
+        stats[f"ch{c}_mean"] = mean
+        stats[f"ch{c}_std"]  = std
 
-    # Pass 2: normalise and serialise each sample
-    idx = 0
-    for basin in BASINS:
-        if basin not in basin_lf:
-            continue
-        data    = basin_data[basin]
-        samples = basin_lf[basin]
+    # Apply normalisation and re-save
+    for sid, out_path in patch_map.items():
+        patch = np.load(out_path)
+        for c in range(patch.shape[1]):
+            patch[:, c, :, :] = (
+                (patch[:, c, :, :] - stats[f"ch{c}_mean"]) / stats[f"ch{c}_std"]
+            )
+        np.save(out_path, patch)
 
-        for _, row in samples.iterrows():
-            sid = row["storm_id"]
-            t0  = row["landfall_time"]
-            sample_id = f"{basin}_{sid}".replace(" ", "_")
+    stats_path = os.path.join(PROC_DIR, "3d_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
 
-            # Data_1d
-            seq_raw = raw_1d_seqs[idx]
-            seq_norm = apply_scaler_1d(sc1d, seq_raw)
-            np.save(os.path.join(PROC_DIR, "1d", f"{sample_id}.npy"), seq_norm)
-
-            # Data_3d
-            patch = load_3d_patch(basin, sid, t0)
-            if patch is not None:
-                np.save(os.path.join(PROC_DIR, "3d", f"{sample_id}.npy"), patch)
-
-            # Env-Data
-            env = load_env_features(basin, sid)
-            if env is not None and scenv is not None:
-                env_norm = scenv.transform(env.reshape(1, -1)).flatten()
-                np.save(os.path.join(PROC_DIR, "env", f"{sample_id}.npy"), env_norm)
-
-            all_samples.append({**row.to_dict(), "sample_id": sample_id,
-                                 "has_3d": patch is not None,
-                                 "has_env": env is not None})
-            idx += 1
-
-    samples_df = pd.DataFrame(all_samples)
-    samples_df.to_csv(os.path.join(PROC_DIR, "samples.csv"), index=False)
-    print(f"\nTotal samples : {len(samples_df)}")
-    print(f"With Data_3d  : {samples_df['has_3d'].sum()}")
-    print(f"With Env-Data : {samples_df['has_env'].sum()}")
-    print(f"Saved to      : {PROC_DIR}")
+    print(f"\nExtracted : {len(patch_map)} storm patches")
+    print(f"Skipped   : {skipped}")
+    print(f"Shape     : (T={lookback}, C=4 [u925 v925 z925 sst], H=81, W=81)")
+    print(f"Stats     : {stats_path}")
+    print(f"Patches   : {os.path.join(PROC_DIR, '3d/')}")
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--basins",   nargs="+", default=["WP", "NA", "EP"])
+    parser.add_argument("--lookback", type=int,  default=LOOKBACK_DEFAULT)
+    args = parser.parse_args()
+    run(args.basins, args.lookback)

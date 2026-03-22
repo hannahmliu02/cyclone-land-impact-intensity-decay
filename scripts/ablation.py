@@ -209,7 +209,8 @@ def _run_task(task: str, target: str, is_clf: bool,
         feat_cols = [c for c in feat_cols if c in df.columns and c not in _META]
         if not feat_cols:
             continue
-        X = df[feat_cols].fillna(df[feat_cols].median())
+        X = df[feat_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce")
+        X = X.fillna(X.median())
 
         print(f"  {name:<30}  {len(feat_cols):3d} features", end="  ")
         if is_clf:
@@ -263,12 +264,14 @@ def run():
     groups = _load_groups()
     configs = _build_configs(groups)
 
-    # ── Task 1: Landfall prediction (binary) ──────────────────────────────────
-    res_lf = _run_task("landfall", "made_landfall", True, lf_df, groups, configs)
+    # ── Task 1: Landfall timing regression (hours_to_landfall) ───────────────
+    lf_df = lf_df[lf_df["hours_to_landfall"] > 0].reset_index(drop=True)
+    res_lf = _run_task("landfall", "hours_to_landfall", False, lf_df, groups, configs)
     lf_path = os.path.join(FEAT_DIR, "ablation_landfall.csv")
     res_lf.to_csv(lf_path, index=False)
     print(f"\nSaved: {lf_path}")
-    _plot_ablation(res_lf, "landfall", "auc", "Landfall Prediction — AUC by Feature Group")
+    _plot_ablation(res_lf, "landfall", "rmse",
+                   "Landfall Timing (hours remaining) — RMSE by Feature Group")
 
     # ── Task 2a: Intensity decay at 24 h ─────────────────────────────────────
     res_24 = _run_task("decay_24h", "wind_24h", False, dc_df, groups, configs)

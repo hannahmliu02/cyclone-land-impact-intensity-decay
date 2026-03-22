@@ -166,45 +166,45 @@ def _tabular_features(window: pd.DataFrame) -> dict:
     return feats
 
 
-# ── Spatial features from Data_3d patch ───────────────────────────────────────
+# Processed patch directory (output of preprocess.py)
+PROC_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
+
+# Channel names for 925 hPa patches produced by preprocess.py
+_SP_CHANNEL_NAMES = ["u925", "v925", "z925", "sst"]
+
+
+# ── Spatial features from preprocessed 925 hPa patches ────────────────────────
 def _spatial_features(basin: str, sid: str) -> dict:
     """
-    Summarise the Data_3d patch (T, C, H, W) into scalar statistics.
-    Returns {} if no patch is found.
+    Read the normalised (T, 4, 81, 81) 925 hPa patch written by preprocess.py
+    and reduce it to scalar summary statistics for tabular feature engineering.
+
+    Channels: u925, v925, z925 (geopotential), sst.
+    Statistics: mean, std, max, p90, left-right asymmetry over (T, H, W).
+
+    Returns {} if no processed patch exists for this storm.
     """
-    base = os.path.join(RAW_DIR, "Data_3d", basin)
-    arr = None
-
-    storm_dir = os.path.join(base, sid)
-    if os.path.isdir(storm_dir):
-        files = sorted(glob.glob(os.path.join(storm_dir, "*.npy")))
-        if files:
-            patches = [np.load(f) for f in files[-LOOKBACK:]]
-            arr = np.stack(patches, axis=0)   # (T, C, H, W)
-
-    if arr is None:
-        npy = os.path.join(base, f"{sid}.npy")
-        if os.path.exists(npy):
-            arr = np.load(npy)
-            if arr.ndim == 3:
-                arr = arr[np.newaxis]
-            arr = arr[-LOOKBACK:]
-
-    if arr is None:
+    npy = os.path.join(PROC_DIR, "3d", f"{sid}.npy")
+    if not os.path.exists(npy):
         return {}
 
+    arr = np.load(npy)           # (T, 4, H, W), already normalised
+    if arr.ndim == 3:
+        arr = arr[np.newaxis]    # edge-case: single snapshot
+
     feats = {}
-    n_channels = arr.shape[1]
-    for c in range(n_channels):
-        patch = arr[:, c, :, :]   # (T, H, W)
-        tag   = f"sp_ch{c}"
-        feats[f"{tag}_mean"]     = float(np.nanmean(patch))
-        feats[f"{tag}_std"]      = float(np.nanstd(patch))
-        feats[f"{tag}_max"]      = float(np.nanmax(patch))
-        feats[f"{tag}_p90"]      = float(np.nanpercentile(patch, 90))
-        feats[f"{tag}_asymmetry"]= float(  # left-right asymmetry across storm
-            np.nanmean(patch[:, :, patch.shape[2]//2:]) -
-            np.nanmean(patch[:, :, :patch.shape[2]//2]))
+    for c, ch_name in enumerate(_SP_CHANNEL_NAMES):
+        if c >= arr.shape[1]:
+            break
+        patch = arr[:, c, :, :]  # (T, H, W)
+        tag   = f"sp_{ch_name}"
+        feats[f"{tag}_mean"]      = float(np.nanmean(patch))
+        feats[f"{tag}_std"]       = float(np.nanstd(patch))
+        feats[f"{tag}_max"]       = float(np.nanmax(patch))
+        feats[f"{tag}_p90"]       = float(np.nanpercentile(patch, 90))
+        feats[f"{tag}_asymmetry"] = float(  # east-west asymmetry of the field
+            np.nanmean(patch[:, :, patch.shape[2] // 2:]) -
+            np.nanmean(patch[:, :, :patch.shape[2] // 2]))
     return feats
 
 
@@ -284,43 +284,61 @@ def build_feature_matrices():
               f"Landfalls: {events['made_landfall'].sum()}")
 
         for _, ev in events.iterrows():
-            sid = ev["storm_id"]
-            t0  = ev["landfall_time"]
+            sid       = ev["storm_id"]
+            peak_time = ev["landfall_time"]
 
-            # Lookback window ending at reference time
             track = data[data["storm_id"] == sid].sort_values("time")
-            window = track[track["time"] <= t0].tail(LOOKBACK)
-            if window.empty:
+
+            # Spatial / env features are storm-level — compute once
+            sp  = _spatial_features(basin, sid)
+            env = _env_features(basin, sid)
+
+            tcnd_split = track["split"].iloc[0] \
+                         if "split" in track.columns else "train"
+
+            # ── Landfall matrix: samples along the decay track ────────
+            # TCND tracks start at/near peak intensity, so there is no
+            # pre-peak window.  Instead generate one sample per track
+            # step offset (0, 2, 4, 6 steps = 0, 12, 24, 36 h after
+            # peak) and predict hours_remaining = how many hours of
+            # track data remain after that reference point.
+            track_times = track["time"].values
+            if len(track_times) < 2:
                 continue
+            track_end = pd.Timestamp(track_times[-1])
+            lf_step_offsets = [0, 2, 4, 6]   # steps from track start
+            for step_i in lf_step_offsets:
+                if step_i >= len(track_times):
+                    break
+                t_ref = pd.Timestamp(track_times[step_i])
+                window = track.iloc[: step_i + 1].tail(LOOKBACK)
+                if len(window) < 2:
+                    continue
+                tab = _tabular_features(window)
+                hours_remaining = (track_end - t_ref).total_seconds() / 3600
+                row_lf = {
+                    "storm_id":          sid,
+                    "basin":             basin,
+                    "split":             tcnd_split,
+                    "ref_time":          t_ref,
+                    "made_landfall":     ev["made_landfall"],
+                    "hours_to_landfall": round(hours_remaining, 1),
+                    **tab, **sp, **env,
+                }
+                landfall_rows.append(row_lf)
 
-            tab  = _tabular_features(window)
-            sp   = _spatial_features(basin, sid)
-            env  = _env_features(basin, sid)
-
-            # Retrieve the TCND split (train/val/test) for this storm
-            storm_rows = data[data["storm_id"] == sid]
-            tcnd_split = storm_rows["split"].iloc[0] \
-                         if "split" in storm_rows.columns else "train"
-
-            base = {
-                "storm_id":      sid,
-                "basin":         basin,
-                "split":         tcnd_split,
-                "ref_time":      t0,
-                "made_landfall": ev["made_landfall"],
-            }
-
-            # ── Landfall matrix ──────────────────────────────────────
-            row_lf = {**base, **tab, **sp, **env}
-            # Time-to-landfall label (hours) — 0 for no-landfall storms
-            row_lf["hours_to_landfall"] = 0.0 if ev["made_landfall"] == 0 else 0.0
-            landfall_rows.append(row_lf)
-
-            # ── Decay matrix (landfall storms only) ──────────────────
+            # ── Decay matrix (landfall storms only, at peak time) ─────
             if ev["made_landfall"] == 1:
+                t0 = peak_time
+                window = track[track["time"] <= t0].tail(LOOKBACK)
+                if window.empty:
+                    continue
+
                 v0 = ev["landfall_wind"]
                 if pd.isna(v0) or v0 == 0:
                     continue
+
+                tab = _tabular_features(window)
 
                 def _wind_at(h):
                     t = t0 + pd.Timedelta(hours=h)
@@ -336,7 +354,11 @@ def build_feature_matrices():
                     continue
 
                 row_dc = {
-                    **base,
+                    "storm_id":       sid,
+                    "basin":          basin,
+                    "split":          tcnd_split,
+                    "ref_time":       t0,
+                    "made_landfall":  ev["made_landfall"],
                     **tab, **sp, **env,
                     "landfall_wind":  v0,
                     "landfall_pres":  ev["landfall_pres"],
