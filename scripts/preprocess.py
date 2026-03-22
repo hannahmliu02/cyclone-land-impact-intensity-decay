@@ -95,8 +95,14 @@ def _build_storm_dir_map(basin: str) -> dict[str, str]:
         for _, row in df.iterrows()
     }
 
-    for year in os.listdir(base):
-        year_dir = os.path.join(base, year)
+    # Some zips extract with an extra basin-named subdirectory (e.g. NA/NA/);
+    # find the actual root by descending into any same-named subdirectory.
+    search_base = base
+    if os.path.isdir(os.path.join(base, basin)):
+        search_base = os.path.join(base, basin)
+
+    for year in os.listdir(search_base):
+        year_dir = os.path.join(search_base, year)
         if not os.path.isdir(year_dir):
             continue
         for storm_name in os.listdir(year_dir):
@@ -181,7 +187,7 @@ def run(basins: list[str], lookback: int):
         sys.exit(f"Feature matrix not found: {decay_path}\n"
                  "Run scripts/features.py first.")
 
-    df = pd.read_csv(decay_path, parse_dates=["ref_time"])
+    df = pd.read_csv(decay_path, parse_dates=["ref_time"], keep_default_na=False)
     df = df[df["basin"].isin(basins)]
     print(f"Decay samples: {len(df)} across basins {basins}")
 
@@ -254,9 +260,173 @@ def run(basins: list[str], lookback: int):
     print(f"Patches   : {os.path.join(PROC_DIR, '3d/')}")
 
 
+# ── Zip-streaming mode (avoids full extraction for large zips) ─────────────────
+def run_from_zip(zip_path: str, basin: str, lookback: int):
+    """
+    Process one basin directly from a zip file, extracting only T=lookback
+    nc files per storm to a temp directory.  Deletes temp files after each
+    storm.  Never has more than ~3 MB of temp files on disk at once.
+
+    Usage:
+      python scripts/preprocess.py --zip /path/to/TCND_Data3D_WP.zip --basins WP
+    """
+    import tempfile, zipfile as _zipfile
+
+    decay_path = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
+    df = pd.read_csv(decay_path, parse_dates=["ref_time"], keep_default_na=False)
+    df = df[df["basin"] == basin].drop_duplicates("storm_id")
+    print(f"Decay samples ({basin}): {len(df)}")
+
+    # Load Data_1d mapping: (year, name) → storm_id
+    try:
+        df1d = _tcnd_load_basin(basin).drop_duplicates("storm_id").copy()
+    except FileNotFoundError:
+        sys.exit(f"Data_1d for {basin} not found.")
+    df1d["year"] = df1d["storm_id"].str[len(basin):len(basin) + 4]
+    id_to_meta = {
+        row["storm_id"]: (row["year"], row["name"])
+        for _, row in df1d.iterrows()
+    }
+
+    print(f"Opening zip: {zip_path}")
+    with _zipfile.ZipFile(zip_path, "r") as zf:
+        all_names = zf.namelist()
+
+        # Build (year, storm_name) → sorted list of zip entry names
+        entry_map: dict[tuple[str, str], list[str]] = {}
+        for name in all_names:
+            if not name.endswith(".nc"):
+                continue
+            parts = name.replace("\\", "/").split("/")
+            # Expected: <anything>/<YEAR>/<STORM_NAME>/TCND_NAME_YYYYMMDDH0_sst_z_u_v.nc
+            nc_idx = next((i for i, p in enumerate(parts) if p.endswith(".nc")), None)
+            if nc_idx is None or nc_idx < 2:
+                continue
+            storm_name = parts[nc_idx - 1]
+            year       = parts[nc_idx - 2]
+            entry_map.setdefault((year, storm_name), []).append(name)
+
+        for k in entry_map:
+            entry_map[k].sort()
+
+        all_patches: list[np.ndarray] = []
+        patch_map:   dict[str, str]   = {}
+        skipped = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for _, row in df.iterrows():
+                sid      = row["storm_id"]
+                ref_time = pd.Timestamp(row["ref_time"])
+                meta     = id_to_meta.get(sid)
+                if meta is None:
+                    skipped += 1
+                    continue
+                year, storm_name = meta
+                entries = entry_map.get((year, storm_name), [])
+                if not entries:
+                    skipped += 1
+                    continue
+
+                # Parse timestamps and select T=lookback steps ending at ref_time
+                dt_entries: dict[pd.Timestamp, str] = {}
+                for e in entries:
+                    dt = _fname_to_dt(os.path.basename(e))
+                    if dt is not None:
+                        dt_entries[pd.Timestamp(dt)] = e
+
+                available = sorted(t for t in dt_entries if t <= ref_time)
+                selected  = available[-lookback:]
+                if not selected:
+                    skipped += 1
+                    continue
+
+                # Extract selected files to tmpdir, load, delete
+                snapshots = []
+                ok = True
+                for ts in selected:
+                    entry = dt_entries[ts]
+                    tmp_nc = os.path.join(tmpdir, os.path.basename(entry))
+                    try:
+                        zf.extract(entry, tmpdir)
+                        # The extract preserves directory structure; find actual file
+                        extracted = os.path.join(tmpdir, entry.replace("\\", "/"))
+                        snap = _load_snapshot(extracted)
+                        if snap is None:
+                            ok = False
+                            break
+                        snapshots.append(snap)
+                        os.remove(extracted)
+                    except Exception as ex:
+                        print(f"  [warn] {sid} {ts}: {ex}")
+                        ok = False
+                        break
+
+                if not ok or not snapshots:
+                    skipped += 1
+                    continue
+
+                patch = np.stack(snapshots, axis=0)
+                if len(snapshots) < lookback:
+                    pad = np.repeat(snapshots[0:1], lookback - len(snapshots), axis=0)
+                    patch = np.concatenate([pad, patch], axis=0)
+
+                out_path = os.path.join(PROC_DIR, "3d", f"{sid}.npy")
+                np.save(out_path, patch)
+                all_patches.append(patch)
+                patch_map[sid] = out_path
+
+        print(f"  Saved: {len(patch_map)}  Skipped: {skipped}")
+
+    if not all_patches:
+        print("No patches extracted.")
+        return
+
+    # Re-normalise using all patches (including previously saved EP/NA)
+    # Load existing patches to compute global stats
+    existing_ids = [f[:-4] for f in os.listdir(os.path.join(PROC_DIR, "3d"))
+                    if f.endswith(".npy")]
+    print(f"\nRecomputing global stats from {len(existing_ids)} total patches …")
+    all_for_stats = []
+    for sid in existing_ids:
+        p = np.load(os.path.join(PROC_DIR, "3d", f"{sid}.npy"))
+        all_for_stats.append(p)
+
+    stack = np.concatenate(all_for_stats, axis=0)
+    stats = {}
+    for c in range(stack.shape[1]):
+        ch = stack[:, c, :, :].reshape(-1).astype(np.float64)
+        ch = ch[np.isfinite(ch)]
+        mean, std = float(np.mean(ch)), float(np.std(ch))
+        stats[f"ch{c}_mean"] = mean
+        stats[f"ch{c}_std"]  = max(std, 1e-6)
+
+    for sid in existing_ids:
+        p = np.load(os.path.join(PROC_DIR, "3d", f"{sid}.npy"))
+        for c in range(p.shape[1]):
+            p[:, c, :, :] = (p[:, c, :, :] - stats[f"ch{c}_mean"]) / stats[f"ch{c}_std"]
+        np.save(os.path.join(PROC_DIR, "3d", f"{sid}.npy"), p)
+
+    stats_path = os.path.join(PROC_DIR, "3d_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"Extracted : {len(patch_map)} new patches for {basin}")
+    print(f"Total     : {len(existing_ids)} patches normalised")
+    print(f"Stats     : {stats_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--basins",   nargs="+", default=["WP", "NA", "EP"])
     parser.add_argument("--lookback", type=int,  default=LOOKBACK_DEFAULT)
+    parser.add_argument("--zip",      default=None,
+                        help="Path to a single-basin Data_3d zip file.  "
+                             "Streams nc files without full extraction.  "
+                             "Use with --basins specifying the single basin.")
     args = parser.parse_args()
-    run(args.basins, args.lookback)
+    if args.zip:
+        if len(args.basins) != 1:
+            sys.exit("--zip requires exactly one basin via --basins")
+        run_from_zip(args.zip, args.basins[0], args.lookback)
+    else:
+        run(args.basins, args.lookback)
