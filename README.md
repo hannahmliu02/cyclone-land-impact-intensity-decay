@@ -1,6 +1,6 @@
 # Cyclone Land-Impact Intensity Decay
 
-Predicting tropical cyclone **landfall impact** and **post-landfall intensity decay** using the **TropiCycloneNet Dataset (TCND)** and a **U-shaped Fourier Neural Operator (UFNO)**.
+Predicting tropical cyclone **landfall timing** and **post-landfall intensity decay** using the **TropiCycloneNet Dataset (TCND)** and a **U-shaped Fourier Neural Operator (UFNO)** with 925 hPa boundary-layer spatial fields.
 
 ---
 
@@ -8,28 +8,34 @@ Predicting tropical cyclone **landfall impact** and **post-landfall intensity de
 
 Two prediction tasks:
 
-1. **Landfall impact** — binary classification: will this storm make landfall? (`feature_matrix_landfall.csv`)
-2. **Intensity decay** — regression: wind speed 24 h and 48 h after reference time (`feature_matrix_decay.csv`)
+1. **Landfall timing** — regression: hours remaining until the storm dissipates, estimated from the current point in the decay track (`feature_matrix_landfall.csv`, target: `hours_to_landfall`)
+2. **Intensity decay** — regression: wind speed 24 h and 48 h after reference time (`feature_matrix_decay.csv`, targets: `wind_24h`, `wind_48h`)
 
-Each task has its own model. The decay model optionally ingests a learned embedding from the frozen landfall model, injected via FiLM conditioning at UFNO blocks 3–5 — so landfall information shapes the spatial field rather than just being another input feature.
+Each task has its own model. The decay model optionally ingests a learned embedding from the frozen landfall model, injected via FiLM conditioning at UFNO blocks 3–5 — so landfall timing information shapes the spatial field rather than just being another input feature.
+
+**Primary spatial input:** 925 hPa boundary-layer fields (u-wind, v-wind, geopotential z, SST) extracted from TCND Data_3d NetCDF files and preprocessed into `(T=8, C=4, H=81, W=81)` tensors per storm.
 
 ---
 
 ## Dataset
 
-**TropiCycloneNet Dataset (TCND)** — Data_1d format
+**TropiCycloneNet Dataset (TCND)** — Data_1d + Data_3d
 
 | Property | Value |
 |---|---|
 | Basins available | WP, NA, EP, NI, SI, SP |
 | Basins used | WP, NA, EP |
 | Total storms (decay task) | 933 |
+| Storms with 925 hPa patches | 932 (WP: 604, NA: 214, EP: 114) |
+| Landfall matrix samples | 7,167 (3 reference times per storm) |
 | Train / Val / Test | 651 / 188 / 94 (TCND original splits) |
-| Format | Tab-separated `.txt`, 8 columns per timestep |
+| Data_1d format | Tab-separated `.txt`, 8 columns per timestep |
+| Data_3d format | NetCDF, 81×81 grid, 4 pressure levels (200/500/850/925 hPa) |
 
-TCND original train/val/test splits are respected throughout — no random re-splitting — to prevent temporal leakage.
+TCND tracks start at or near peak intensity — all track data represents the post-peak decay phase. TCND original train/val/test splits are respected throughout to prevent temporal leakage.
 
-Raw data: `data/raw/_tmp/Data1D/<basin>/<split>/`
+Raw Data_1d: `data/raw/_tmp/Data1D/<basin>/<split>/`
+Processed patches: `data/processed/3d/<storm_id>.npy`
 
 ---
 
@@ -38,17 +44,16 @@ Raw data: `data/raw/_tmp/Data1D/<basin>/<split>/`
 | Script | Purpose |
 |---|---|
 | `scripts/load_tcnd.py` | Shared TCND Data_1d loader |
-| `scripts/features.py` | Feature engineering from Data_1d |
-| `scripts/features_improved.py` | Extended features: Data_3d (pressure drop, wind shear, SST), Env-Data, improved land-sea |
+| `scripts/preprocess.py` | Extract 925 hPa patches from Data_3d NetCDF files; supports `--zip` streaming mode for large basins |
+| `scripts/features.py` | Feature engineering — tabular (wind, pressure, position) + spatial scalar summaries from 925 hPa patches |
 | `scripts/ablation.py` | Ablation study — ranks feature groups by R², writes `selected_feature_groups.json` |
 | `scripts/explain.py` | SHAP + LIME feature importance (optional) |
 | `scripts/ufno.py` | CycloneUFNO model architecture |
-| `scripts/train_ufno.py` | Training — landfall and decay tasks |
+| `scripts/train_ufno.py` | Training — landfall timing and decay tasks |
 | `scripts/view_results.py` | 8-panel results dashboard |
 | `scripts/log_experiment.py` | Log experiment results to `experiments/` |
 | `scripts/cross_basin.py` | Cross-basin generalization experiments |
 | `scripts/download_data.py` | TCND data downloader |
-| `scripts/preprocess.py` | Preprocessing for spatial (Data_3d) mode |
 
 ---
 
@@ -66,57 +71,56 @@ Based on **Gege Wen et al. 2022** ([github.com/gegewen/ufno](https://github.com/
 | Parameters | ~11 M |
 
 **Task outputs:**
-- Landfall: `(B, 1)` logit — apply sigmoid for P(landfall)
+- Landfall: `(B, 1)` → `hours_to_landfall` (hours remaining in storm track)
 - Decay: `(B, 2)` → `[wind_24h, wind_48h]`
 
-**Input modes:**
-- Spatial — 3D patch tensors + tabular (requires `data/processed/`)
-- Tabular-only — tabular features projected to 16×16 pseudo-grid (auto-detected fallback)
+**Input modes (auto-detected):**
+- Spatial — 925 hPa patch tensors `(T, 4, H, W)` + tabular (requires `data/processed/3d/`)
+- Tabular-only — tabular features projected to 16×16 pseudo-grid (fallback when no patches)
 
 Device priority: CUDA → MPS (Apple Silicon) → CPU.
 
 ---
 
-## Feature Engineering
+## Pipeline
 
-Features computed from the 48-hour track window before the reference time.
+### Step 0. Download and preprocess spatial data
 
-| Group | Features | Ablation R² (24h) |
-|---|---|---|
-| wind | last, max, mean, std, delta_6h/12h/24h, trend | 0.269 |
-| pressure | last, min, mean, std, delta_6h/12h/24h, trend | 0.260 |
-| wp_couple | wp_residual | 0.272 |
-| position | lat_last, lon_norm_last, motion_speed, motion_dir | negative |
-| land_sea | over_land, dist_to_coast, land_frac_window | negative |
-
-**Selected groups (ablation-driven):** `wp_couple`, `wind`, `pressure` — 17 features total.
-
-`ablation.py` automatically updates `data/features/selected_feature_groups.json`, which `train_ufno.py` reads at startup.
-
----
-
-## Usage
-
-### 1. Build features
 ```bash
-python scripts/features.py
-# or, for extended 3D/env features:
-python scripts/features_improved.py
+# EP (extract from zip, standard mode)
+python scripts/preprocess.py --basins EP
+
+# NA (same)
+python scripts/preprocess.py --basins NA
+
+# WP (13 GB zip — stream directly without full extraction)
+python scripts/preprocess.py --zip /path/to/TCND_Data3D_WP.zip --basins WP
 ```
 
-### 2. Run ablation (auto-updates feature selection)
+Saves `(8, 4, 81, 81)` normalised 925 hPa patches to `data/processed/3d/`.
+
+### Step 1. Build feature matrices
+
+```bash
+python scripts/features.py
+```
+
+Builds `feature_matrix_landfall.csv` and `feature_matrix_decay.csv`, including 20 spatial scalar summary features derived from the 925 hPa patches.
+
+### Step 2. Run ablation (auto-updates feature selection)
+
 ```bash
 python scripts/ablation.py
 ```
 
-### 3. Train — two-stage
+### Step 3. Train — two-stage
 
-**Step 1: landfall model**
+**Stage 1: landfall timing model**
 ```bash
 python scripts/train_ufno.py --task landfall --epochs 100
 ```
 
-**Step 2: decay model with landfall embedding**
+**Stage 2: decay model with landfall embedding**
 ```bash
 python scripts/train_ufno.py --task decay --epochs 150 \
     --landfall-ckpt models/best_ufno_landfall.pt
@@ -133,36 +137,59 @@ Options:
 --landfall-ckpt PATH              Landfall checkpoint for embedding injection
 --epochs        int               Training epochs           (default 100)
 --batch         int               Batch size                (default 8)
---lr            float             Initial learning rate     (default 1e-3)
+--lr            float             Initial LR                (default 1e-3)
 --modes         int               Fourier modes             (default 12)
 --width         int               UFNO hidden width         (default 32)
 --unet-dropout  float             UNet dropout              (default 0.2)
 --seed          int               Random seed               (default 42)
 ```
 
-### 4. View results
+### Step 4. View results
+
 ```bash
 python scripts/view_results.py --show
 ```
+
 Saves an 8-panel dashboard to `figures/ufno_results/dashboard.png`.
 
-### 5. Log the experiment
+### Step 5. Log the experiment
+
 ```bash
 python scripts/log_experiment.py \
   --name "Two-stage: landfall embedding in decay model" \
   --notes "What you observed"
 ```
 
-### 6. Feature importance (optional)
+### Step 6. Feature importance (optional)
+
 ```bash
 python scripts/explain.py
 ```
 
-### 7. Cross-basin generalization (optional)
+### Step 7. Cross-basin generalization (optional)
+
 ```bash
 python scripts/cross_basin.py --epochs 60
 ```
-Produces transfer RMSE heatmap, gradual basin addition curves, and in-domain vs transfer comparison.
+
+---
+
+## Feature Engineering
+
+| Group | Source | Features | Ablation R² (decay 24h) |
+|---|---|---|---|
+| wp_couple | Data_1d | wind-pressure residual | 0.272 |
+| wind | Data_1d | last, max, mean, std, delta_6h/12h/24h, trend | 0.269 |
+| pressure | Data_1d | last, min, mean, std, delta_6h/12h/24h, trend | 0.216 |
+| spatial | Data_3d 925 hPa | mean, std, max, p90, asymmetry × 4 channels | 0.093 |
+| position | Data_1d | lat, lon_norm, motion_speed, motion_dir | negative |
+| land_sea | derived | over_land, dist_to_coast, land_frac_window | negative |
+
+**Selected groups (ablation-driven):** `wp_couple`, `wind`, `pressure`, `spatial` — 37 features total.
+
+Spatial scalar summaries (R²=0.093) understate the value of 925 hPa patches for the UFNO, which ingests the full `(T, 4, 81, 81)` field directly.
+
+`ablation.py` automatically updates `data/features/selected_feature_groups.json`, which `train_ufno.py` reads at startup.
 
 ---
 
@@ -170,14 +197,16 @@ Produces transfer RMSE heatmap, gradual basin addition curves, and in-domain vs 
 
 | Path | Contents |
 |---|---|
-| `data/features/feature_matrix_decay.csv` | 933 × 35 feature matrix — decay task |
-| `data/features/feature_matrix_landfall.csv` | 2389 × 30 feature matrix — landfall task |
+| `data/processed/3d/<storm_id>.npy` | (8, 4, 81, 81) normalised 925 hPa patch per storm |
+| `data/processed/3d_stats.json` | Per-channel global mean/std used for normalisation |
+| `data/features/feature_matrix_decay.csv` | 933 × 55 feature matrix — decay task |
+| `data/features/feature_matrix_landfall.csv` | 7,167 × 50 feature matrix — landfall timing task |
 | `data/features/feature_groups.json` | Feature group definitions |
 | `data/features/selected_feature_groups.json` | Ablation-selected groups (auto-updated) |
 | `data/features/ablation_*.csv` | Ablation results per task |
 | `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
-| `models/best_ufno_landfall.pt` | Best landfall model checkpoint |
-| `models/best_ufno_decay.pt` | Best decay model checkpoint |
+| `models/best_ufno_landfall.pt` | Best landfall timing checkpoint |
+| `models/best_ufno_decay.pt` | Best decay checkpoint |
 | `models/ufno_history.json` | Per-epoch loss and MAE log |
 | `figures/ufno_results/dashboard.png` | 8-panel results dashboard |
 | `figures/ufno_results/predictions.csv` | Test-set predictions with errors |
@@ -194,6 +223,8 @@ numpy
 pandas
 scikit-learn
 xgboost
+xarray
+netCDF4
 shap
 tqdm
 matplotlib
@@ -201,5 +232,5 @@ lime          # optional — LIME explanations skipped if not installed
 ```
 
 ```bash
-pip install torch numpy pandas scikit-learn xgboost shap tqdm matplotlib
+pip install torch numpy pandas scikit-learn xgboost xarray netCDF4 shap tqdm matplotlib
 ```
