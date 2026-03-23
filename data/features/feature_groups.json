@@ -26,7 +26,8 @@
     "lat_last",
     "lon_norm_last",
     "motion_speed_kph",
-    "motion_dir_deg"
+    "motion_dir_sin",
+    "motion_dir_cos"
   ],
   "spatial": [
     "sp_u925_mean",

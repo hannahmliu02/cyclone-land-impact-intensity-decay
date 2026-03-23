@@ -93,14 +93,15 @@ def load_model(ckpt_path: str):
 
 # ── Run inference on a DataFrame ──────────────────────────────────────────────
 def predict(model, df: pd.DataFrame, meta: dict,
-            tgt_mean, tgt_scale) -> pd.DataFrame:
+            tgt_mean, tgt_scale, tab_mean=None, tab_scale=None) -> pd.DataFrame:
     """Returns df with added columns: pred_24h, pred_48h, err_24h, err_48h."""
-    tab_cols  = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
-    tab_scaler = StandardScaler()
-
-    # Fit scaler on full df (viewer uses all available data for display)
-    X_tab = tab_scaler.fit_transform(
-        df[tab_cols].values.astype(np.float32))
+    tab_cols = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
+    X_raw = df[tab_cols].values.astype(np.float32)
+    if tab_mean is not None and tab_scale is not None:
+        X_tab = (X_raw - np.array(tab_mean)) / np.array(tab_scale)
+    else:
+        tab_scaler = StandardScaler()
+        X_tab = tab_scaler.fit_transform(X_raw)
 
     preds = []
     with torch.no_grad():
@@ -128,14 +129,14 @@ def predict(model, df: pd.DataFrame, meta: dict,
 
 # ── Landfall predict ──────────────────────────────────────────────────────────
 def predict_landfall(model, df: pd.DataFrame, meta: dict,
-                     tgt_mean, tgt_scale) -> pd.DataFrame:
+                     tgt_mean, tgt_scale, tab_mean, tab_scale) -> pd.DataFrame:
     """Returns df with added columns: pred_htl, err_htl, mae_htl."""
     tab_cols = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
-    tab_scaler = StandardScaler()
 
     X_raw = df[tab_cols].replace("", np.nan).apply(
         pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
-    X_tab = tab_scaler.fit_transform(X_raw)
+    # Use the scaler fitted on training data (saved in checkpoint)
+    X_tab = (X_raw - np.array(tab_mean)) / np.array(tab_scale)
 
     preds = []
     with torch.no_grad():
@@ -438,7 +439,7 @@ def main():
     print(f"Loading checkpoint : {ckpt_path}")
     model, meta, ckpt = load_model(ckpt_path)
 
-    hist_path = os.path.join(root, "models", "ufno_history.json")
+    hist_path = os.path.join(root, "models", f"ufno_history_{args.task}.json")
     history   = json.load(open(hist_path)) if os.path.exists(hist_path) else None
 
     # ── Landfall task ──────────────────────────────────────────────────────────
@@ -454,7 +455,8 @@ def main():
         print(f"Evaluating on {len(df)} samples …")
 
         df = predict_landfall(model, df, meta,
-                              ckpt["tgt_mean"], ckpt["tgt_scale"])
+                              ckpt["tgt_mean"], ckpt["tgt_scale"],
+                              ckpt.get("tab_mean"), ckpt.get("tab_scale"))
 
         # Text summary
         rmse = np.sqrt((df["err_htl"] ** 2).mean())
@@ -501,7 +503,8 @@ def main():
     print(f"Evaluating on {len(df)} samples …")
 
     df = predict(model, df, meta,
-                 ckpt["tgt_mean"], ckpt["tgt_scale"])
+                 ckpt["tgt_mean"], ckpt["tgt_scale"],
+                 ckpt.get("tab_mean"), ckpt.get("tab_scale"))
 
     print_summary(df, meta)
 

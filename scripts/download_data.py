@@ -76,6 +76,22 @@ def cleanup():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pillars", nargs="+",
+                        default=TARGET_PILLARS,
+                        choices=TARGET_PILLARS,
+                        help="Which data pillars to download (default: all)")
+    parser.add_argument("--basins", nargs="+",
+                        default=TARGET_BASINS,
+                        choices=TARGET_BASINS,
+                        help="Which basins to keep (default: all)")
+    cli = parser.parse_args()
+
+    # Apply CLI filters
+    TARGET_PILLARS[:] = cli.pillars
+    TARGET_BASINS[:]  = cli.basins
+
     download()
     results = extract()
     cleanup()
@@ -84,4 +100,4 @@ if __name__ == "__main__":
         print("\nNo matching files found. Verify the Drive folder structure.")
     else:
         print(f"\nDone — {len(results)} dataset(s) ready.")
-        print("Next step: python scripts/train.py")
+        print("Next step: python scripts/features.py")

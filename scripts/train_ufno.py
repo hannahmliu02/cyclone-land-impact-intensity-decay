@@ -271,7 +271,7 @@ def _split_df(df, seed):
 
 
 def load_data(seed: int, task: str = "decay", batch: int = 8):
-    """Return (train_loader, val_loader, test_loader, meta, tgt_scaler)."""
+    """Return (train_loader, val_loader, test_loader, meta, tgt_scaler, tab_scaler)."""
     tab_cols_for_task = _load_tab_cols(task)
 
     if task == "landfall":
@@ -319,7 +319,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
         return (DataLoader(train_ds, sampler=sampler, **kw),
                 DataLoader(val_ds,   shuffle=False,   **kw),
                 DataLoader(test_ds,  shuffle=False,   **kw),
-                meta, tgt_scaler)
+                meta, tgt_scaler, tab_scaler)
 
     # ── decay task ────────────────────────────────────────────────────────────
     decay_csv = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
@@ -498,7 +498,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    train_loader, val_loader, test_loader, meta, tgt_scaler = \
+    train_loader, val_loader, test_loader, meta, tgt_scaler, tab_scaler = \
         load_data(args.seed, task=args.task, batch=args.batch)
 
     mode = meta["mode"]
@@ -559,8 +559,9 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-3)
+    patience = 5 if task == "landfall" else 10
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-5)
+        optimizer, mode="min", factor=0.5, patience=patience, min_lr=1e-5)
 
     history  = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
     best_val = float("inf")
@@ -601,6 +602,9 @@ def main():
             if tgt_scaler is not None:
                 ckpt["tgt_mean"]  = tgt_scaler.mean_.tolist()
                 ckpt["tgt_scale"] = tgt_scaler.scale_.tolist()
+            if tab_scaler is not None:
+                ckpt["tab_mean"]  = tab_scaler.mean_.tolist()
+                ckpt["tab_scale"] = tab_scaler.scale_.tolist()
             torch.save(ckpt, os.path.join(MODELS_DIR, ckpt_name))
 
         elapsed = time.time() - t0
@@ -624,7 +628,7 @@ def main():
         last_ckpt["tgt_scale"] = tgt_scaler.scale_.tolist()
     torch.save(last_ckpt, os.path.join(MODELS_DIR, f"last_ufno_{task}.pt"))
 
-    hist_path = os.path.join(MODELS_DIR, "ufno_history.json")
+    hist_path = os.path.join(MODELS_DIR, f"ufno_history_{task}.json")
     with open(hist_path, "w") as f:
         json.dump(history, f, indent=2)
 
