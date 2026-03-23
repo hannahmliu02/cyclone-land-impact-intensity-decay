@@ -21,6 +21,8 @@ Ablation strategies
 
 import json
 import os
+import subprocess
+import sys
 import warnings
 
 import matplotlib
@@ -288,12 +290,68 @@ def _save_selected_groups(res: pd.DataFrame, groups: dict,
     print(f"  Written to: {out_path}")
 
 
+# ── Spatial modality ablation (3D patches vs tabular-only) ────────────────────
+def _run_spatial_modality_ablation(task: str, epochs: int = 20) -> dict | None:
+    """
+    Train UFNO twice (with and without 3D patches) for `epochs` epochs each.
+    Returns dict with val_loss_tabular, val_loss_spatial, delta, and improvement_pct.
+    Requires Data_3d patches to exist in data/processed/3d[_landfall]/.
+    """
+    patch_dir = os.path.join(os.path.dirname(__file__), "..", "data", "processed",
+                             "3d_landfall" if task == "landfall" else "3d")
+    if not os.path.isdir(patch_dir) or not any(
+        f.endswith(".npy") for f in os.listdir(patch_dir)
+    ):
+        print(f"  [spatial modality] No patches found in {patch_dir} — skipping.")
+        return None
+
+    script = os.path.join(os.path.dirname(__file__), "train_ufno.py")
+    base_cmd = [sys.executable, script, "--task", task,
+                "--epochs", str(epochs), "--early-stop", "10",
+                "--batch", "32", "--lr", "3e-4"]
+
+    results = {}
+    for mode, extra in [("tabular", ["--no-spatial"]), ("spatial", [])]:
+        print(f"\n  [spatial modality — {task}/{mode}] training {epochs} epochs …")
+        cmd = base_cmd + extra
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              cwd=os.path.join(os.path.dirname(__file__), ".."))
+        # Parse best val loss from stdout
+        best_val = None
+        for line in proc.stdout.splitlines():
+            if "Best val loss:" in line:
+                try:
+                    best_val = float(line.split("Best val loss:")[-1].strip())
+                except ValueError:
+                    pass
+        if best_val is None:
+            print(f"    [warn] Could not parse val loss from output.")
+            print(proc.stdout[-500:] if proc.stdout else proc.stderr[-500:])
+        else:
+            print(f"    Best val loss ({mode}): {best_val:.4f}")
+        results[mode] = best_val
+
+    tab = results.get("tabular")
+    spa = results.get("spatial")
+    if tab is not None and spa is not None:
+        delta = tab - spa          # positive = spatial is better (lower loss)
+        pct   = 100 * delta / tab if tab > 0 else 0.0
+        print(f"\n  Spatial improvement over tabular-only: {delta:+.4f} ({pct:+.1f}%)")
+        return {"task": task, "val_loss_tabular": tab, "val_loss_spatial": spa,
+                "delta": delta, "improvement_pct": pct}
+    return None
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=["landfall", "decay", "all"],
                         default="all",
                         help="Which task(s) to run ablation for (default: all)")
+    parser.add_argument("--spatial-modality", action="store_true",
+                        help="Also run spatial modality ablation (trains UFNO twice per task)")
+    parser.add_argument("--spatial-epochs", type=int, default=20,
+                        help="Epochs for spatial modality ablation (default: 20)")
     cli = parser.parse_args()
 
     lf_df  = _load("landfall")
@@ -322,5 +380,42 @@ if __name__ == "__main__":
                        "Intensity Decay (48 h) — RMSE by Feature Group")
 
         _save_selected_groups(res_24, groups, "decay", "r2_mean_decay_24h")
+
+    # ── Spatial modality ablation ──────────────────────────────────────────────
+    if cli.spatial_modality:
+        print("\n" + "="*60)
+        print("Spatial Modality Ablation (3D patches vs tabular-only)")
+        print("="*60)
+
+        # Build landfall patches first if needed
+        lf_patch_dir = os.path.join(FEAT_DIR, "..", "processed", "3d_landfall")
+        lf_patch_dir = os.path.normpath(lf_patch_dir)
+        if not os.path.isdir(lf_patch_dir) or not any(
+            f.endswith(".npy") for f in os.listdir(lf_patch_dir)
+            if os.path.isdir(lf_patch_dir)
+        ):
+            print("\nBuilding landfall spatial patches (preprocess --task landfall)…")
+            preprocess_script = os.path.join(os.path.dirname(__file__), "preprocess.py")
+            subprocess.run([sys.executable, preprocess_script, "--task", "landfall"],
+                           cwd=os.path.join(os.path.dirname(__file__), ".."))
+
+        modality_results = []
+        tasks_to_run = []
+        if cli.task in ("landfall", "all"):
+            tasks_to_run.append("landfall")
+        if cli.task in ("decay", "all"):
+            tasks_to_run.append("decay")
+
+        for t in tasks_to_run:
+            res = _run_spatial_modality_ablation(t, epochs=cli.spatial_epochs)
+            if res:
+                modality_results.append(res)
+
+        if modality_results:
+            mod_df = pd.DataFrame(modality_results)
+            out_path = os.path.join(FEAT_DIR, "ablation_spatial_modality.csv")
+            mod_df.to_csv(out_path, index=False)
+            print(f"\n  Saved: {out_path}")
+            print(mod_df.to_string(index=False))
 
     print("\nAblation complete.")
