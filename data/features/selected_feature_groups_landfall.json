@@ -1,10 +1,11 @@
 {
   "selected_groups": [
+    "env",
     "spatial",
     "position",
+    "wind",
     "wp_couple",
-    "pressure",
-    "wind"
+    "pressure"
   ],
   "ranked_by": "r2_mean_landfall"
 }

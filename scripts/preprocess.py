@@ -356,21 +356,42 @@ def run_landfall(basins: list[str], lookback: int):
 
 
 # ── Zip-streaming mode (avoids full extraction for large zips) ─────────────────
-def run_from_zip(zip_path: str, basin: str, lookback: int):
+def run_from_zip(zip_path: str, basin: str, lookback: int, task: str = "decay"):
     """
     Process one basin directly from a zip file, extracting only T=lookback
     nc files per storm to a temp directory.  Deletes temp files after each
     storm.  Never has more than ~3 MB of temp files on disk at once.
 
+    task: "decay"    — one patch per storm (keyed by storm_id)
+          "landfall" — one patch per (storm, ref_time) row (keyed by storm_id_YYYYMMDDHH)
+          "all"      — runs both
+
     Usage:
       python scripts/preprocess.py --zip /path/to/TCND_Data3D_WP.zip --basins WP
+      python scripts/preprocess.py --zip /path/to/TCND_Data3D_WP.zip --basins WP --task landfall
     """
+    if task == "all":
+        run_from_zip(zip_path, basin, lookback, task="decay")
+        run_from_zip(zip_path, basin, lookback, task="landfall")
+        return
+
     import tempfile, zipfile as _zipfile
 
-    decay_path = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
-    df = pd.read_csv(decay_path, parse_dates=["ref_time"], keep_default_na=False)
-    df = df[df["basin"] == basin].drop_duplicates("storm_id")
-    print(f"Decay samples ({basin}): {len(df)}")
+    is_landfall = (task == "landfall")
+    out_dir     = os.path.join(PROC_DIR, "3d_landfall" if is_landfall else "3d")
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat_path = os.path.join(FEAT_DIR,
+                             "feature_matrix_landfall.csv" if is_landfall
+                             else "feature_matrix_decay.csv")
+    df = pd.read_csv(feat_path, parse_dates=["ref_time"], keep_default_na=False)
+    df = df[df["basin"] == basin]
+    if is_landfall:
+        df = df[pd.to_numeric(df["hours_to_landfall"], errors="coerce").fillna(0) > 0
+                ].reset_index(drop=True)
+    else:
+        df = df.drop_duplicates("storm_id")
+    print(f"{'Landfall' if is_landfall else 'Decay'} samples ({basin}): {len(df)}")
 
     # Load Data_1d mapping: (year, name) → storm_id
     try:
@@ -412,7 +433,16 @@ def run_from_zip(zip_path: str, basin: str, lookback: int):
             for _, row in df.iterrows():
                 sid      = row["storm_id"]
                 ref_time = pd.Timestamp(row["ref_time"])
-                meta     = id_to_meta.get(sid)
+                ref_str  = ref_time.strftime("%Y%m%d%H")
+                key      = f"{sid}_{ref_str}" if is_landfall else sid
+                out_path = os.path.join(out_dir, f"{key}.npy")
+
+                # Skip if already extracted
+                if os.path.exists(out_path):
+                    patch_map[key] = out_path
+                    continue
+
+                meta = id_to_meta.get(sid)
                 if meta is None:
                     skipped += 1
                     continue
@@ -440,10 +470,8 @@ def run_from_zip(zip_path: str, basin: str, lookback: int):
                 ok = True
                 for ts in selected:
                     entry = dt_entries[ts]
-                    tmp_nc = os.path.join(tmpdir, os.path.basename(entry))
                     try:
                         zf.extract(entry, tmpdir)
-                        # The extract preserves directory structure; find actual file
                         extracted = os.path.join(tmpdir, entry.replace("\\", "/"))
                         snap = _load_snapshot(extracted)
                         if snap is None:
@@ -465,48 +493,42 @@ def run_from_zip(zip_path: str, basin: str, lookback: int):
                     pad = np.repeat(snapshots[0:1], lookback - len(snapshots), axis=0)
                     patch = np.concatenate([pad, patch], axis=0)
 
-                out_path = os.path.join(PROC_DIR, "3d", f"{sid}.npy")
                 np.save(out_path, patch)
                 all_patches.append(patch)
-                patch_map[sid] = out_path
+                patch_map[key] = out_path
 
         print(f"  Saved: {len(patch_map)}  Skipped: {skipped}")
 
-    if not all_patches:
+    if not all_patches and not patch_map:
         print("No patches extracted.")
         return
 
-    # Re-normalise using all patches (including previously saved EP/NA)
-    # Load existing patches to compute global stats
-    existing_ids = [f[:-4] for f in os.listdir(os.path.join(PROC_DIR, "3d"))
-                    if f.endswith(".npy")]
-    print(f"\nRecomputing global stats from {len(existing_ids)} total patches …")
-    all_for_stats = []
-    for sid in existing_ids:
-        p = np.load(os.path.join(PROC_DIR, "3d", f"{sid}.npy"))
-        all_for_stats.append(p)
+    # Re-normalise using all patches in out_dir
+    existing_keys = [f[:-4] for f in os.listdir(out_dir) if f.endswith(".npy")]
+    print(f"\nRecomputing global stats from {len(existing_keys)} total patches …")
+    all_for_stats = [np.load(os.path.join(out_dir, f"{k}.npy")) for k in existing_keys]
 
     stack = np.concatenate(all_for_stats, axis=0)
     stats = {}
     for c in range(stack.shape[1]):
         ch = stack[:, c, :, :].reshape(-1).astype(np.float64)
         ch = ch[np.isfinite(ch)]
-        mean, std = float(np.mean(ch)), float(np.std(ch))
-        stats[f"ch{c}_mean"] = mean
-        stats[f"ch{c}_std"]  = max(std, 1e-6)
+        stats[f"ch{c}_mean"] = float(np.mean(ch))
+        stats[f"ch{c}_std"]  = float(max(np.std(ch), 1e-6))
 
-    for sid in existing_ids:
-        p = np.load(os.path.join(PROC_DIR, "3d", f"{sid}.npy"))
+    for k in existing_keys:
+        p = np.load(os.path.join(out_dir, f"{k}.npy"))
         for c in range(p.shape[1]):
             p[:, c, :, :] = (p[:, c, :, :] - stats[f"ch{c}_mean"]) / stats[f"ch{c}_std"]
-        np.save(os.path.join(PROC_DIR, "3d", f"{sid}.npy"), p)
+        np.save(os.path.join(out_dir, f"{k}.npy"), p)
 
-    stats_path = os.path.join(PROC_DIR, "3d_stats.json")
+    stats_fname = "3d_landfall_stats.json" if is_landfall else "3d_stats.json"
+    stats_path  = os.path.join(PROC_DIR, stats_fname)
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
 
-    print(f"Extracted : {len(patch_map)} new patches for {basin}")
-    print(f"Total     : {len(existing_ids)} patches normalised")
+    print(f"Extracted : {len(patch_map)} new patches for {basin} ({task})")
+    print(f"Total     : {len(existing_keys)} patches normalised")
     print(f"Stats     : {stats_path}")
 
 
@@ -525,7 +547,7 @@ if __name__ == "__main__":
     if args.zip:
         if len(args.basins) != 1:
             sys.exit("--zip requires exactly one basin via --basins")
-        run_from_zip(args.zip, args.basins[0], args.lookback)
+        run_from_zip(args.zip, args.basins[0], args.lookback, task=args.task)
     else:
         if args.task in ("decay", "all"):
             run(args.basins, args.lookback)
