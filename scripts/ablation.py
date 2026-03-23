@@ -258,72 +258,69 @@ def _plot_ablation(results: pd.DataFrame, task: str, metric: str, title: str):
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-def run():
+
+
+def _save_selected_groups(res: pd.DataFrame, groups: dict,
+                          task: str, ranked_by: str):
+    """
+    Pick the best-performing feature groups (by R²) from single-group ablation
+    rows and write them to selected_feature_groups_{task}.json.
+    """
+    single = res[res["label"].str.startswith("only_")].copy()
+    if single.empty:
+        print(f"  [warn] No single-group rows for {task} — skipping auto-update.")
+        return
+
+    single["group"] = single["label"].str.replace("only_", "", n=1)
+
+    positive = single[single["r2_mean"] > 0].sort_values("r2_mean", ascending=False)
+    if positive.empty:
+        print(f"  [warn] No groups with positive R² for {task} — keeping all groups.")
+        selected = list(single["group"])
+    else:
+        selected = list(positive["group"])
+
+    out_path = os.path.join(FEAT_DIR, f"selected_feature_groups_{task}.json")
+    with open(out_path, "w") as f:
+        json.dump({"selected_groups": selected, "ranked_by": ranked_by}, f, indent=2)
+
+    print(f"\n  [{task}] Selected feature groups (by R²): {selected}")
+    print(f"  Written to: {out_path}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=["landfall", "decay", "all"],
+                        default="all",
+                        help="Which task(s) to run ablation for (default: all)")
+    cli = parser.parse_args()
+
     lf_df  = _load("landfall")
     dc_df  = _load("decay")
     groups = _load_groups()
     configs = _build_configs(groups)
 
-    # ── Task 1: Landfall timing regression (hours_to_landfall) ───────────────
     lf_df = lf_df[lf_df["hours_to_landfall"] > 0].reset_index(drop=True)
-    res_lf = _run_task("landfall", "hours_to_landfall", False, lf_df, groups, configs)
-    lf_path = os.path.join(FEAT_DIR, "ablation_landfall.csv")
-    res_lf.to_csv(lf_path, index=False)
-    print(f"\nSaved: {lf_path}")
-    _plot_ablation(res_lf, "landfall", "rmse",
-                   "Landfall Timing (hours remaining) — RMSE by Feature Group")
 
-    # ── Task 2a: Intensity decay at 24 h ─────────────────────────────────────
-    res_24 = _run_task("decay_24h", "wind_24h", False, dc_df, groups, configs)
-    res_24.to_csv(os.path.join(FEAT_DIR, "ablation_decay_24h.csv"), index=False)
-    _plot_ablation(res_24, "decay_24h", "rmse",
-                   "Intensity Decay (24 h) — RMSE by Feature Group")
+    if cli.task in ("landfall", "all"):
+        res_lf = _run_task("landfall", "hours_to_landfall", False, lf_df, groups, configs)
+        res_lf.to_csv(os.path.join(FEAT_DIR, "ablation_landfall.csv"), index=False)
+        _plot_ablation(res_lf, "landfall", "rmse",
+                       "Landfall Timing (hours remaining) — RMSE by Feature Group")
+        _save_selected_groups(res_lf, groups, "landfall", "r2_mean_landfall")
 
-    # ── Task 2b: Intensity decay at 48 h ─────────────────────────────────────
-    res_48 = _run_task("decay_48h", "wind_48h", False, dc_df, groups, configs)
-    res_48.to_csv(os.path.join(FEAT_DIR, "ablation_decay_48h.csv"), index=False)
-    _plot_ablation(res_48, "decay_48h", "rmse",
-                   "Intensity Decay (48 h) — RMSE by Feature Group")
+    if cli.task in ("decay", "all"):
+        res_24 = _run_task("decay_24h", "wind_24h", False, dc_df, groups, configs)
+        res_24.to_csv(os.path.join(FEAT_DIR, "ablation_decay_24h.csv"), index=False)
+        _plot_ablation(res_24, "decay_24h", "rmse",
+                       "Intensity Decay (24 h) — RMSE by Feature Group")
+
+        res_48 = _run_task("decay_48h", "wind_48h", False, dc_df, groups, configs)
+        res_48.to_csv(os.path.join(FEAT_DIR, "ablation_decay_48h.csv"), index=False)
+        _plot_ablation(res_48, "decay_48h", "rmse",
+                       "Intensity Decay (48 h) — RMSE by Feature Group")
+
+        _save_selected_groups(res_24, groups, "decay", "r2_mean_decay_24h")
 
     print("\nAblation complete.")
-
-    # ── Auto-update selected feature groups for train_ufno.py ────────────────
-    _save_selected_groups(res_24, groups)
-
-
-def _save_selected_groups(res_24: pd.DataFrame, groups: dict):
-    """
-    From decay_24h ablation results, pick the best-performing feature groups
-    (by R²) from the single-group rows ('only_*'), then write the selected
-    group names to data/features/selected_feature_groups.json so that
-    train_ufno.py can load them dynamically.
-    """
-    # Only look at single-group runs
-    single = res_24[res_24["label"].str.startswith("only_")].copy()
-    if single.empty:
-        print("  [warn] No single-group rows found — skipping auto-update.")
-        return
-
-    # Parse group name from label ("only_wind" → "wind")
-    single = single.copy()
-    single["group"] = single["label"].str.replace("only_", "", n=1)
-
-    # Keep groups with positive R²
-    positive = single[single["r2_mean"] > 0].sort_values("r2_mean", ascending=False)
-    if positive.empty:
-        print("  [warn] No groups with positive R² — keeping all groups.")
-        selected = list(single["group"])
-    else:
-        selected = list(positive["group"])
-
-    out_path = os.path.join(FEAT_DIR, "selected_feature_groups.json")
-    with open(out_path, "w") as f:
-        json.dump({"selected_groups": selected,
-                   "ranked_by": "r2_mean_decay_24h"}, f, indent=2)
-
-    print(f"\n  Selected feature groups (by R²): {selected}")
-    print(f"  Written to: {out_path}")
-
-
-if __name__ == "__main__":
-    run()

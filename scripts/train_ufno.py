@@ -73,28 +73,46 @@ DEVICE = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("cpu"))
 
 # ── Feature columns — loaded dynamically from ablation output ─────────────────
-def _load_tab_cols() -> list:
-    """
-    Load tabular feature columns from ablation-selected groups.
+_FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
 
-    Priority:
-      1. data/features/selected_feature_groups.json  (written by ablation.py)
-      2. Hardcoded fallback (wind + pressure + wp_couple)
-    """
-    feat_dir = os.path.join(os.path.dirname(__file__), "..", "data", "features")
-    sel_path = os.path.join(feat_dir, "selected_feature_groups.json")
-    grp_path = os.path.join(feat_dir, "feature_groups.json")
-
-    fallback = [
+_FALLBACK_COLS = {
+    "landfall": [
+        "wp_residual",
+        "wind_last", "wind_max", "wind_mean", "wind_std",
+        "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
+        "pres_last", "pres_min", "pres_mean", "pres_std",
+        "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
+    ],
+    "decay": [
         "wind_last", "wind_max", "wind_mean", "wind_std",
         "wind_delta_6h", "wind_delta_12h", "wind_delta_24h", "wind_trend",
         "pres_last", "pres_min", "pres_mean", "pres_std",
         "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
         "wp_residual",
-    ]
+    ],
+}
 
-    if not os.path.exists(sel_path) or not os.path.exists(grp_path):
-        print("[train_ufno] selected_feature_groups.json not found — using fallback TAB_COLS.")
+def _load_tab_cols(task: str) -> list:
+    """
+    Load tabular feature columns from the task-specific ablation selection.
+
+    Priority:
+      1. data/features/selected_feature_groups_{task}.json  (written by ablation.py)
+      2. data/features/selected_feature_groups.json         (legacy fallback)
+      3. Hardcoded fallback
+    """
+    grp_path = os.path.join(_FEAT_DIR, "feature_groups.json")
+    fallback  = _FALLBACK_COLS[task]
+
+    # Candidate paths in priority order
+    candidates = [
+        os.path.join(_FEAT_DIR, f"selected_feature_groups_{task}.json"),
+        os.path.join(_FEAT_DIR, "selected_feature_groups.json"),
+    ]
+    sel_path = next((p for p in candidates if os.path.exists(p)), None)
+
+    if sel_path is None or not os.path.exists(grp_path):
+        print(f"[train_ufno] No ablation selection found for '{task}' — using fallback TAB_COLS.")
         return fallback
 
     with open(sel_path) as f:
@@ -109,15 +127,15 @@ def _load_tab_cols() -> list:
     cols = list(dict.fromkeys(cols))   # dedup, preserve order
 
     if not cols:
-        print("[train_ufno] selected_feature_groups.json produced no columns — using fallback.")
+        print(f"[train_ufno] Ablation selection for '{task}' produced no columns — using fallback.")
         return fallback
 
-    print(f"[train_ufno] TAB_COLS loaded from ablation: {len(cols)} features "
-          f"from groups {selected_groups}")
+    print(f"[train_ufno] TAB_COLS ({task}): {len(cols)} features "
+          f"from groups {selected_groups}  [{os.path.basename(sel_path)}]")
     return cols
 
 
-TAB_COLS    = _load_tab_cols()
+TAB_COLS    = _load_tab_cols("decay")   # overridden per-task in load_data()
 TARGET_COLS = ["wind_24h", "wind_48h"]
 LANDFALL_TARGET = "hours_to_landfall"
 
@@ -134,10 +152,11 @@ class LandfallDataset(Dataset):
     def __init__(self, df: pd.DataFrame,
                  tab_scaler: StandardScaler,
                  tgt_scaler: StandardScaler,
-                 fit: bool = False):
+                 fit: bool = False,
+                 tab_cols: list = None):
         # hours_to_landfall = hours_remaining in track (always positive)
         df = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
-        tab_cols = [c for c in TAB_COLS if c in df.columns]
+        tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
         X = df[tab_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
         y = df[[LANDFALL_TARGET]].values.astype(np.float32)   # (N,1)
 
@@ -162,8 +181,9 @@ class TabularDecayDataset(Dataset):
     def __init__(self, df: pd.DataFrame,
                  tab_scaler: StandardScaler,
                  tgt_scaler: StandardScaler,
-                 fit: bool = False):
-        tab_cols = [c for c in TAB_COLS if c in df.columns]
+                 fit: bool = False,
+                 tab_cols: list = None):
+        tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
         X = df[tab_cols].values.astype(np.float32)
         y = df[TARGET_COLS].values.astype(np.float32)
 
@@ -192,8 +212,9 @@ class SpatialDecayDataset(Dataset):
     def __init__(self, df: pd.DataFrame,
                  tab_scaler: StandardScaler,
                  tgt_scaler: StandardScaler,
-                 fit: bool = False):
-        tab_cols = [c for c in TAB_COLS if c in df.columns]
+                 fit: bool = False,
+                 tab_cols: list = None):
+        tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
         X_tab = df[tab_cols].values.astype(np.float32)
         y     = df[TARGET_COLS].values.astype(np.float32)
 
@@ -251,6 +272,7 @@ def _split_df(df, seed):
 
 def load_data(seed: int, task: str = "decay", batch: int = 8):
     """Return (train_loader, val_loader, test_loader, meta, tgt_scaler)."""
+    tab_cols_for_task = _load_tab_cols(task)
 
     if task == "landfall":
         csv = os.path.join(FEAT_DIR, "feature_matrix_landfall.csv")
@@ -270,9 +292,9 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
         tgt_scaler = StandardScaler()
         train_df, val_df, test_df = _split_df(df_lf, seed)
 
-        train_ds = LandfallDataset(train_df, tab_scaler, tgt_scaler, fit=True)
-        val_ds   = LandfallDataset(val_df,   tab_scaler, tgt_scaler, fit=False)
-        test_ds  = LandfallDataset(test_df,  tab_scaler, tgt_scaler, fit=False)
+        train_ds = LandfallDataset(train_df, tab_scaler, tgt_scaler, fit=True,  tab_cols=tab_cols_for_task)
+        val_ds   = LandfallDataset(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
+        test_ds  = LandfallDataset(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
 
         # Basin-weighted sampler to handle EP under-representation
         basin_counts   = train_df["basin"].value_counts().to_dict()
@@ -281,7 +303,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
         sampler = WeightedRandomSampler(sample_weights, len(sample_weights),
                                         replacement=True)
 
-        tab_cols = [c for c in TAB_COLS if c in df.columns]
+        tab_cols = [c for c in tab_cols_for_task if c in df.columns]
         meta = {
             "task":      "landfall",
             "mode":      "tabular",
@@ -328,9 +350,9 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
     else:
         DS, collate = SpatialDecayDataset, _collate_spatial
 
-    train_ds = DS(train_df, tab_scaler, tgt_scaler, fit=True)
-    val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False)
-    test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False)
+    train_ds = DS(train_df, tab_scaler, tgt_scaler, fit=True,  tab_cols=tab_cols_for_task)
+    val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
+    test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
 
     # Basin-weighted sampler: oversample EP
     basin_counts   = train_df["basin"].value_counts().to_dict()
@@ -340,7 +362,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
                                     replacement=True)
 
     kw = dict(batch_size=batch, num_workers=0, collate_fn=collate)
-    tab_cols = [c for c in TAB_COLS if c in df.columns]
+    tab_cols = [c for c in tab_cols_for_task if c in df.columns]
     meta = {
         "task":      "decay",
         "mode":      mode,
@@ -468,6 +490,11 @@ def main():
     parser.add_argument("--seed",   type=int,   default=42)
     args = parser.parse_args()
 
+    # Landfall is tabular-only — use a smaller model unless overridden
+    if args.task == "landfall":
+        if args.modes == 12: args.modes = 8
+        if args.width == 32: args.width = 16
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -528,10 +555,10 @@ def main():
     print(f"Epochs     : {args.epochs}")
 
     # ── Loss ───────────────────────────────────────────────────────────────
-    criterion = LpLoss(p=2)
+    criterion = nn.MSELoss() if task == "landfall" else LpLoss(p=2)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
-                                 weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-5)
 
