@@ -1,12 +1,13 @@
 """
 Extract 925 hPa boundary-layer patches from TCND Data_3d NetCDF files.
 
-For each storm in the decay feature matrix, reads T=8 NetCDF files ending at
-the reference time, extracts the 925 hPa level for u, v, z and the 2-D SST
-field, stacks them into a (T, 4, 81, 81) tensor, normalises per channel, and
-saves to data/processed/3d/{storm_id}.npy.
+For each storm in the decay/landfall feature matrix, reads T=8 NetCDF files
+ending at the reference time, extracts the 925 hPa level for u, v, z and the
+2-D SST field, stacks them into a (T, 4, 81, 81) tensor, normalises per
+channel, and saves to data/processed/3d[_landfall]/{storm_id[_ref]}.npy.
 
-The saved patches are consumed by SpatialDecayDataset in train_ufno.py.
+The saved patches are consumed by SpatialDecayDataset / SpatialLandfallDataset
+in train_ufno.py.
 
 Directory layout expected
 ─────────────────────────
@@ -16,11 +17,14 @@ data/raw/_tmp/Data3D/<BASIN>/<YEAR>/<STORM_NAME>/
 Usage
 ─────
   python scripts/preprocess.py [--basins WP NA EP] [--lookback 8]
+                                [--task decay|landfall|all]
 
 Outputs
 ───────
-  data/processed/3d/<storm_id>.npy   — (T, 4, H, W) float32
-  data/processed/3d_stats.json       — per-channel global mean/std
+  data/processed/3d/<storm_id>.npy                      — decay patches
+  data/processed/3d_stats.json                          — decay channel stats
+  data/processed/3d_landfall/<storm_id>_<YYYYMMDDHH>.npy — landfall patches
+  data/processed/3d_landfall_stats.json                 — landfall channel stats
 """
 
 import argparse
@@ -49,7 +53,8 @@ FEAT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "features")
 PRESSURE_IDX = 3
 LOOKBACK_DEFAULT = 8   # number of 6-hour steps
 
-os.makedirs(os.path.join(PROC_DIR, "3d"), exist_ok=True)
+os.makedirs(os.path.join(PROC_DIR, "3d"),          exist_ok=True)
+os.makedirs(os.path.join(PROC_DIR, "3d_landfall"), exist_ok=True)
 
 
 # ── Filename → datetime ────────────────────────────────────────────────────────
@@ -260,6 +265,96 @@ def run(basins: list[str], lookback: int):
     print(f"Patches   : {os.path.join(PROC_DIR, '3d/')}")
 
 
+# ── Landfall patch extraction ─────────────────────────────────────────────────
+def run_landfall(basins: list[str], lookback: int):
+    """
+    Build one (T, 4, 81, 81) patch per (storm, ref_time) row in
+    feature_matrix_landfall.csv and save to data/processed/3d_landfall/.
+
+    Filename: {storm_id}_{YYYYMMDDHH}.npy  (one file per observation)
+    """
+    lf_path = os.path.join(FEAT_DIR, "feature_matrix_landfall.csv")
+    if not os.path.exists(lf_path):
+        sys.exit(f"Feature matrix not found: {lf_path}\nRun scripts/features.py first.")
+
+    df = pd.read_csv(lf_path, parse_dates=["ref_time"], keep_default_na=False)
+    df = df[df["basin"].isin(basins)]
+    df = df[df["hours_to_landfall"] > 0].reset_index(drop=True)
+    print(f"Landfall samples: {len(df)} across basins {basins}")
+
+    out_dir = os.path.join(PROC_DIR, "3d_landfall")
+    all_patches: list[np.ndarray] = []
+    patch_map:   dict[str, str]   = {}   # key → saved path
+    skipped = 0
+
+    for basin in basins:
+        print(f"\n── {basin} ─────────────────────────────────────")
+        dir_map  = _build_storm_dir_map(basin)
+        print(f"  Data_3d storms found: {len(dir_map)}")
+
+        basin_df = df[df["basin"] == basin]
+
+        for _, row in basin_df.iterrows():
+            sid      = row["storm_id"]
+            ref_time = pd.Timestamp(row["ref_time"])
+            ref_str  = ref_time.strftime("%Y%m%d%H")
+            key      = f"{sid}_{ref_str}"
+            out_path = os.path.join(out_dir, f"{key}.npy")
+
+            # Skip if already extracted
+            if os.path.exists(out_path):
+                patch_map[key] = out_path
+                continue
+
+            storm_dir = dir_map.get(sid)
+            if storm_dir is None:
+                skipped += 1
+                continue
+
+            patch = _build_patch(storm_dir, ref_time, lookback)
+            if patch is None:
+                skipped += 1
+                continue
+
+            np.save(out_path, patch)
+            all_patches.append(patch)
+            patch_map[key] = out_path
+
+        print(f"  Saved: {len(patch_map)}  Skipped: {skipped}")
+
+    if not all_patches and not patch_map:
+        print("\nNo patches extracted. Check Data_3d path and feature matrix.")
+        return
+
+    # ── Global per-channel normalisation ──────────────────────────────────────
+    # Load all patches (including previously saved ones) for global stats
+    all_keys = [f[:-4] for f in os.listdir(out_dir) if f.endswith(".npy")]
+    print(f"\nComputing global channel statistics from {len(all_keys)} patches …")
+    all_for_stats = [np.load(os.path.join(out_dir, f"{k}.npy")) for k in all_keys]
+    stack = np.concatenate(all_for_stats, axis=0)
+    stats = {}
+    for c in range(stack.shape[1]):
+        ch = stack[:, c, :, :].reshape(-1).astype(np.float64)
+        ch = ch[np.isfinite(ch)]
+        stats[f"ch{c}_mean"] = float(np.mean(ch))
+        stats[f"ch{c}_std"]  = float(max(np.std(ch), 1e-6))
+
+    for k in all_keys:
+        p = np.load(os.path.join(out_dir, f"{k}.npy"))
+        for c in range(p.shape[1]):
+            p[:, c, :, :] = (p[:, c, :, :] - stats[f"ch{c}_mean"]) / stats[f"ch{c}_std"]
+        np.save(os.path.join(out_dir, f"{k}.npy"), p)
+
+    stats_path = os.path.join(PROC_DIR, "3d_landfall_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"\nExtracted : {len(patch_map)} landfall patches")
+    print(f"Skipped   : {skipped}")
+    print(f"Stats     : {stats_path}")
+    print(f"Patches   : {out_dir}/")
+
+
 # ── Zip-streaming mode (avoids full extraction for large zips) ─────────────────
 def run_from_zip(zip_path: str, basin: str, lookback: int):
     """
@@ -419,6 +514,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--basins",   nargs="+", default=["WP", "NA", "EP"])
     parser.add_argument("--lookback", type=int,  default=LOOKBACK_DEFAULT)
+    parser.add_argument("--task",     choices=["decay", "landfall", "all"],
+                        default="all",
+                        help="Which task's patches to build (default: all)")
     parser.add_argument("--zip",      default=None,
                         help="Path to a single-basin Data_3d zip file.  "
                              "Streams nc files without full extraction.  "
@@ -429,4 +527,7 @@ if __name__ == "__main__":
             sys.exit("--zip requires exactly one basin via --basins")
         run_from_zip(args.zip, args.basins[0], args.lookback)
     else:
-        run(args.basins, args.lookback)
+        if args.task in ("decay", "all"):
+            run(args.basins, args.lookback)
+        if args.task in ("landfall", "all"):
+            run_landfall(args.basins, args.lookback)

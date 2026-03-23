@@ -175,6 +175,49 @@ class LandfallDataset(Dataset):
     def __getitem__(self, i): return self.X[i], self.y[i]
 
 
+class SpatialLandfallDataset(Dataset):
+    """
+    Multimodal landfall dataset: tabular features + Data_3d image patches.
+    Patch files: data/processed/3d_landfall/{storm_id}_{YYYYMMDDHH}.npy
+    Falls back gracefully (returns None for x3d) when a patch is missing.
+    """
+    LF_PATCH_DIR = os.path.join(PROC_DIR, "3d_landfall")
+
+    def __init__(self, df: pd.DataFrame,
+                 tab_scaler: StandardScaler,
+                 tgt_scaler: StandardScaler,
+                 fit: bool = False,
+                 tab_cols: list = None):
+        df = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
+        tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
+        X = df[tab_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
+        y = df[[LANDFALL_TARGET]].values.astype(np.float32)
+
+        if fit:
+            X = tab_scaler.fit_transform(X)
+            y = tgt_scaler.fit_transform(y)
+        else:
+            X = tab_scaler.transform(X)
+            y = tgt_scaler.transform(y)
+
+        self.X_tab = torch.tensor(X, dtype=torch.float32)
+        self.y     = torch.tensor(y, dtype=torch.float32)
+        self.meta  = df[["storm_id", "basin"]].reset_index(drop=True)
+        # Build patch keys: storm_id + ref_time timestamp string
+        self.keys  = [
+            f"{row['storm_id']}_{pd.Timestamp(row['ref_time']).strftime('%Y%m%d%H')}"
+            for _, row in df.iterrows()
+        ]
+
+    def __len__(self): return len(self.X_tab)
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        npy = os.path.join(self.LF_PATCH_DIR, f"{key}.npy")
+        x3d = torch.tensor(np.load(npy), dtype=torch.float32) if os.path.exists(npy) else None
+        return x3d, self.X_tab[idx], self.y[idx]
+
+
 class TabularDecayDataset(Dataset):
     """Tabular-only dataset — no spatial patches required."""
 
@@ -270,7 +313,8 @@ def _split_df(df, seed):
     return train_df, val_df, test_df
 
 
-def load_data(seed: int, task: str = "decay", batch: int = 8):
+def load_data(seed: int, task: str = "decay", batch: int = 8,
+              no_spatial: bool = False):
     """Return (train_loader, val_loader, test_loader, meta, tgt_scaler, tab_scaler)."""
     tab_cols_for_task = _load_tab_cols(task)
 
@@ -280,9 +324,17 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
             raise FileNotFoundError("Run features.py first — feature_matrix_landfall.csv not found.")
         df = pd.read_csv(csv, keep_default_na=False)
         df = df.dropna(subset=[LANDFALL_TARGET]).reset_index(drop=True)
-        # hours_to_landfall = hours remaining in track (always positive)
         df_lf = df[df[LANDFALL_TARGET] > 0].reset_index(drop=True)
+
+        # Spatial mode: use SpatialLandfallDataset if patches exist
+        lf_patch_dir = os.path.join(PROC_DIR, "3d_landfall")
+        has_lf_patches = (not no_spatial and
+                          os.path.isdir(lf_patch_dir) and
+                          any(f.endswith(".npy") for f in os.listdir(lf_patch_dir)))
+        lf_mode = "spatial" if has_lf_patches else "tabular"
+
         print(f"Task       : landfall (hours_to_landfall regression)")
+        print(f"Data mode  : {lf_mode}")
         print(f"Total rows : {len(df)}  |  landfall rows: {len(df_lf)}")
         print(f"Basins     : {df_lf['basin'].value_counts().to_dict()}")
         print(f"hrs range  : [{df_lf[LANDFALL_TARGET].min():.0f}, "
@@ -292,9 +344,14 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
         tgt_scaler = StandardScaler()
         train_df, val_df, test_df = _split_df(df_lf, seed)
 
-        train_ds = LandfallDataset(train_df, tab_scaler, tgt_scaler, fit=True,  tab_cols=tab_cols_for_task)
-        val_ds   = LandfallDataset(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
-        test_ds  = LandfallDataset(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
+        if lf_mode == "spatial":
+            DS, collate = SpatialLandfallDataset, _collate_spatial
+        else:
+            DS, collate = LandfallDataset, None
+
+        train_ds = DS(train_df, tab_scaler, tgt_scaler, fit=True,  tab_cols=tab_cols_for_task)
+        val_ds   = DS(val_df,   tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
+        test_ds  = DS(test_df,  tab_scaler, tgt_scaler, fit=False, tab_cols=tab_cols_for_task)
 
         # Basin-weighted sampler to handle EP under-representation
         basin_counts   = train_df["basin"].value_counts().to_dict()
@@ -306,7 +363,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
         tab_cols = [c for c in tab_cols_for_task if c in df.columns]
         meta = {
             "task":      "landfall",
-            "mode":      "tabular",
+            "mode":      lf_mode,
             "tab_dim":   len(tab_cols),
             "tab_cols":  tab_cols,
             "tgt_mean":  tgt_scaler.mean_.tolist(),
@@ -315,7 +372,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
             "n_val":     len(val_ds),
             "n_test":    len(test_ds),
         }
-        kw = dict(batch_size=batch, num_workers=0)
+        kw = dict(batch_size=batch, num_workers=0, collate_fn=collate)
         return (DataLoader(train_ds, sampler=sampler, **kw),
                 DataLoader(val_ds,   shuffle=False,   **kw),
                 DataLoader(test_ds,  shuffle=False,   **kw),
@@ -333,7 +390,8 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
     df = df.dropna(subset=TARGET_COLS).reset_index(drop=True)
 
     # Spatial mode: activated when preprocess.py has written patches to 3d/
-    has_patches = (os.path.isdir(patch_dir) and
+    has_patches = (not no_spatial and
+                   os.path.isdir(patch_dir) and
                    any(f.endswith(".npy") for f in os.listdir(patch_dir)))
     mode = "spatial" if has_patches else "tabular"
 
@@ -491,9 +549,11 @@ def main():
     parser.add_argument("--early-stop",  type=int,   default=20,
                         help="Stop if val loss does not improve for N epochs "
                              "(0 = disabled)")
+    parser.add_argument("--no-spatial",  action="store_true",
+                        help="Force tabular-only mode even when 3D patches exist")
     args = parser.parse_args()
 
-    # Landfall is tabular-only — use a smaller model unless overridden
+    # Landfall defaults — use a smaller model unless overridden
     if args.task == "landfall":
         if args.modes == 12: args.modes = 8
         if args.width == 32: args.width = 16
@@ -502,7 +562,8 @@ def main():
     np.random.seed(args.seed)
 
     train_loader, val_loader, test_loader, meta, tgt_scaler, tab_scaler = \
-        load_data(args.seed, task=args.task, batch=args.batch)
+        load_data(args.seed, task=args.task, batch=args.batch,
+                  no_spatial=args.no_spatial)
 
     mode = meta["mode"]
     task = args.task
