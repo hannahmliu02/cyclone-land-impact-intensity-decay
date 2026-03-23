@@ -57,7 +57,8 @@ TAB_COLS = [
     "pres_last", "pres_min", "pres_mean", "pres_std",
     "pres_delta_6h", "pres_delta_12h", "pres_delta_24h", "pres_trend",
     "wp_residual",
-    "lat_last", "lon_last", "motion_speed_kph", "motion_dir_deg",
+    "lat_last", "lon_norm_last", "motion_speed_kph",
+    "motion_dir_sin", "motion_dir_cos",
     "over_land", "dist_to_coast", "land_frac_window",
 ]
 
@@ -129,14 +130,17 @@ def predict(model, df: pd.DataFrame, meta: dict,
 
 # ── Landfall predict ──────────────────────────────────────────────────────────
 def predict_landfall(model, df: pd.DataFrame, meta: dict,
-                     tgt_mean, tgt_scale, tab_mean, tab_scale) -> pd.DataFrame:
+                     tgt_mean, tgt_scale,
+                     tab_mean=None, tab_scale=None) -> pd.DataFrame:
     """Returns df with added columns: pred_htl, err_htl, mae_htl."""
     tab_cols = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
 
     X_raw = df[tab_cols].replace("", np.nan).apply(
         pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
-    # Use the scaler fitted on training data (saved in checkpoint)
-    X_tab = (X_raw - np.array(tab_mean)) / np.array(tab_scale)
+    if tab_mean is not None and tab_scale is not None:
+        X_tab = (X_raw - np.array(tab_mean)) / np.array(tab_scale)
+    else:
+        X_tab = StandardScaler().fit_transform(X_raw)
 
     preds = []
     with torch.no_grad():

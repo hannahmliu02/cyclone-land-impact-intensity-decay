@@ -377,7 +377,7 @@ def load_data(seed: int, task: str = "decay", batch: int = 8):
     return (DataLoader(train_ds, sampler=sampler, **kw),
             DataLoader(val_ds,   shuffle=False,   **kw),
             DataLoader(test_ds,  shuffle=False,   **kw),
-            meta, tgt_scaler)
+            meta, tgt_scaler, tab_scaler)
 
 
 # ── Training / evaluation loops ───────────────────────────────────────────────
@@ -626,6 +626,9 @@ def main():
     if tgt_scaler is not None:
         last_ckpt["tgt_mean"]  = tgt_scaler.mean_.tolist()
         last_ckpt["tgt_scale"] = tgt_scaler.scale_.tolist()
+    if tab_scaler is not None:
+        last_ckpt["tab_mean"]  = tab_scaler.mean_.tolist()
+        last_ckpt["tab_scale"] = tab_scaler.scale_.tolist()
     torch.save(last_ckpt, os.path.join(MODELS_DIR, f"last_ufno_{task}.pt"))
 
     hist_path = os.path.join(MODELS_DIR, f"ufno_history_{task}.json")
