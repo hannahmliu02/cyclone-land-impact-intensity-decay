@@ -213,12 +213,116 @@ def _spatial_features(basin: str, sid: str) -> dict:
 
 
 # ── Environmental features from Env-Data ──────────────────────────────────────
-def _env_features(basin: str, sid: str) -> dict:
+# Cache: basin → {storm_id: storm_dir}
+_ENV_DIR_CACHE: dict[str, dict[str, str]] = {}
+
+def _build_env_dir_map(basin: str) -> dict[str, str]:
+    """Returns {storm_id: abs_path_to_storm_dir} for Env-Data/{basin}/."""
+    if basin in _ENV_DIR_CACHE:
+        return _ENV_DIR_CACHE[basin]
+
+    base = os.path.join(RAW_DIR, "Env-Data", basin)
+    if not os.path.isdir(base):
+        _ENV_DIR_CACHE[basin] = {}
+        return {}
+
+    try:
+        df1d = _tcnd_load_basin(basin).drop_duplicates("storm_id").copy()
+    except FileNotFoundError:
+        _ENV_DIR_CACHE[basin] = {}
+        return {}
+
+    df1d["year"] = df1d["storm_id"].str[len(basin):len(basin) + 4]
+    year_name_to_id = {
+        (row["year"], row["name"]): row["storm_id"]
+        for _, row in df1d.iterrows()
+    }
+
+    mapping: dict[str, str] = {}
+    for year in os.listdir(base):
+        year_dir = os.path.join(base, year)
+        if not os.path.isdir(year_dir):
+            continue
+        for storm_name in os.listdir(year_dir):
+            storm_dir = os.path.join(year_dir, storm_name)
+            if not os.path.isdir(storm_dir):
+                continue
+            sid = year_name_to_id.get((year, storm_name))
+            if sid is not None:
+                mapping[sid] = storm_dir
+
+    _ENV_DIR_CACHE[basin] = mapping
+    return mapping
+
+
+def _env_features(basin: str, sid: str, ref_time: pd.Timestamp = None) -> dict:
+    """
+    Load pre-computed environmental features from Env-Data/{basin}/{year}/{name}/*.npy.
+    Each .npy file is a dict keyed by feature name for one 6-hourly timestep.
+    Aggregates the LOOKBACK steps ending at ref_time (last, mean, trend).
+    Falls back to legacy flat-array or CSV formats if the new format is absent.
+    """
+    # ── New format: year/STORMNAME/TIMESTAMP.npy dicts ────────────────────────
+    dir_map = _build_env_dir_map(basin)
+    storm_dir = dir_map.get(sid)
+    if storm_dir is not None:
+        # Index files by timestamp
+        ts_map: dict[pd.Timestamp, str] = {}
+        for fname in os.listdir(storm_dir):
+            if not fname.endswith(".npy"):
+                continue
+            stem = fname[:-4]   # e.g. '2005011812'
+            try:
+                ts = pd.Timestamp(
+                    int(stem[:4]), int(stem[4:6]), int(stem[6:8]), int(stem[8:10])
+                )
+                ts_map[ts] = os.path.join(storm_dir, fname)
+            except Exception:
+                continue
+
+        if ts_map:
+            # Select up to LOOKBACK steps ending at ref_time (or latest available)
+            cutoff = ref_time if ref_time is not None else max(ts_map)
+            available = sorted(t for t in ts_map if t <= cutoff)
+            selected  = available[-LOOKBACK:]
+            if not selected:
+                selected = sorted(ts_map)[-LOOKBACK:]
+
+            snapshots = []
+            scalar_keys = None
+            for ts in selected:
+                raw = np.load(ts_map[ts], allow_pickle=True).item()
+                flat = {}
+                for k, v in raw.items():
+                    arr = np.asarray(v, dtype=np.float32).flatten()
+                    if arr.size == 1:
+                        flat[k] = float(arr[0])
+                    else:
+                        for i, x in enumerate(arr):
+                            flat[f"{k}_{i}"] = float(x)
+                snapshots.append(flat)
+                if scalar_keys is None:
+                    scalar_keys = list(flat.keys())
+
+            if snapshots:
+                feats: dict[str, float] = {}
+                for key in scalar_keys:
+                    vals = [s[key] for s in snapshots if key in s]
+                    if not vals:
+                        continue
+                    feats[f"env_{key}_last"] = vals[-1]
+                    feats[f"env_{key}_mean"] = float(np.mean(vals))
+                    if len(vals) >= 2:
+                        feats[f"env_{key}_trend"] = vals[-1] - vals[0]
+                return feats
+
+    # ── Legacy: flat array ─────────────────────────────────────────────────────
     npy = os.path.join(RAW_DIR, "Env-Data", basin, f"{sid}.npy")
     if os.path.exists(npy):
         arr = np.load(npy).flatten()
         return {f"env_{i}": float(v) for i, v in enumerate(arr)}
 
+    # ── Legacy: CSV ────────────────────────────────────────────────────────────
     csv_files = glob.glob(os.path.join(RAW_DIR, "Env-Data", basin, "**", "*.csv"),
                           recursive=True)
     for f in csv_files:
@@ -293,9 +397,8 @@ def build_feature_matrices():
 
             track = data[data["storm_id"] == sid].sort_values("time")
 
-            # Spatial / env features are storm-level — compute once
+            # Spatial features are storm-level — compute once
             sp  = _spatial_features(basin, sid)
-            env = _env_features(basin, sid)
 
             tcnd_split = track["split"].iloc[0] \
                          if "split" in track.columns else "train"
@@ -319,6 +422,7 @@ def build_feature_matrices():
                 if len(window) < 2:
                     continue
                 tab = _tabular_features(window)
+                env = _env_features(basin, sid, ref_time=t_ref)
                 hours_remaining = (track_end - t_ref).total_seconds() / 3600
                 row_lf = {
                     "storm_id":          sid,
@@ -343,6 +447,7 @@ def build_feature_matrices():
                     continue
 
                 tab = _tabular_features(window)
+                env = _env_features(basin, sid, ref_time=t0)
 
                 def _wind_at(h):
                     t = t0 + pd.Timedelta(hours=h)
