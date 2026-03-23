@@ -487,7 +487,10 @@ def main():
                         help="Dropout rate inside UNet2d branches")
     parser.add_argument("--no-tab", action="store_true",
                         help="Disable tabular FiLM conditioning")
-    parser.add_argument("--seed",   type=int,   default=42)
+    parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--early-stop",  type=int,   default=20,
+                        help="Stop if val loss does not improve for N epochs "
+                             "(0 = disabled)")
     args = parser.parse_args()
 
     # Landfall is tabular-only — use a smaller model unless overridden
@@ -563,8 +566,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=patience, min_lr=1e-5)
 
-    history  = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
-    best_val = float("inf")
+    history       = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
+    best_val      = float("inf")
+    epochs_no_imp = 0
     ckpt_name = f"best_ufno_{task}.pt"
 
     header = (f"{'Epoch':>6}  {'Train':>8}  {'Val':>8}  "
@@ -592,7 +596,10 @@ def main():
 
         is_best = vl_loss < best_val
         if is_best:
-            best_val = vl_loss
+            best_val      = vl_loss
+            epochs_no_imp = 0
+        else:
+            epochs_no_imp += 1
             ckpt = {
                 "epoch":      epoch,
                 "state":      model.state_dict(),
@@ -617,6 +624,10 @@ def main():
             print()
 
         sys.stdout.flush()
+
+        if args.early_stop > 0 and epochs_no_imp >= args.early_stop:
+            print(f"\nEarly stopping — no val improvement for {args.early_stop} epochs.")
+            break
 
     # ── Save last checkpoint + history ────────────────────────────────────
     last_ckpt = {
