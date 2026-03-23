@@ -148,10 +148,14 @@ def _tabular_features(window: pd.DataFrame) -> dict:
                     if "lon_norm" in w.columns else 0.0
         # motion_speed uses lat-based km conversion for dlat; dlon_norm is unitless
         feats["motion_speed_kph"] = math.hypot(dlat * 111, dlon_norm * 30) / 6
-        feats["motion_dir_deg"]   = math.degrees(math.atan2(dlon_norm, dlat)) % 360
+        # Encode direction as sin/cos to avoid 0°/360° discontinuity
+        dir_rad = math.atan2(dlon_norm, dlat)
+        feats["motion_dir_sin"] = math.sin(dir_rad)
+        feats["motion_dir_cos"] = math.cos(dir_rad)
     else:
         feats["motion_speed_kph"] = 0.0
-        feats["motion_dir_deg"]   = 0.0
+        feats["motion_dir_sin"]   = 0.0
+        feats["motion_dir_cos"]   = 0.0
 
     # ── land-sea group ───────────────────────────────────────────────
     # lon_norm is normalised so the geographic land-mask is not applicable.
@@ -387,7 +391,8 @@ def build_feature_matrices():
         "pressure":  [c for c in all_cols if c.startswith("pres")],
         "wp_couple": [c for c in all_cols if "wp_" in c],
         "position":  [c for c in all_cols if c in
-                      ("lat_last","lon_norm_last","motion_speed_kph","motion_dir_deg")],
+                      ("lat_last","lon_norm_last","motion_speed_kph",
+                       "motion_dir_sin","motion_dir_cos")],
         "spatial":   [c for c in all_cols if c.startswith("sp_")],
         "env":       [c for c in all_cols if c.startswith("env_")],
         "land_sea":  [c for c in all_cols if c in
