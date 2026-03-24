@@ -26,15 +26,32 @@ RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 TMP_DIR = os.path.join(RAW_DIR, "_tmp")
 
 
+def _data_already_extracted():
+    """Returns True only if actual TCND data files are present under data/raw."""
+    data1d = os.path.join(RAW_DIR, "Data_1d")
+    if os.path.isdir(data1d):
+        for root, _, files in os.walk(data1d):
+            if any(f.endswith(".txt") for f in files):
+                return True
+    data3d = os.path.join(RAW_DIR, "Data_3d")
+    if os.path.isdir(data3d):
+        for root, _, files in os.walk(data3d):
+            if any(f.endswith(".nc") for f in files):
+                return True
+    return False
+
+
 def download():
     os.makedirs(TMP_DIR, exist_ok=True)
-    
-    # Check if the directory already has files in it
-    if os.listdir(TMP_DIR): 
-        print(f"Files already exist in {TMP_DIR}. Skipping download.")
+
+    # Skip only if actual data files are already present
+    if _data_already_extracted():
+        print("Data already extracted under data/raw/. Skipping download.")
         return
-    elif os.listdir(RAW_DIR): 
-        print(f"Files already exist in {RAW_DIR}. Skipping download.")
+
+    # Also skip if the tmp dir already has downloaded zips waiting to be extracted
+    if os.listdir(TMP_DIR):
+        print(f"Downloaded files already in {TMP_DIR}. Skipping re-download.")
         return
 
     print(f"Downloading TCND from Google Drive...\n{FOLDER_URL}\n")
