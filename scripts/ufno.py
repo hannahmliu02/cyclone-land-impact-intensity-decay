@@ -301,7 +301,7 @@ class CycloneUFNO(nn.Module):
     """
 
     def __init__(self,
-                 sp_channels:  int = 5,
+                 sp_channels:  int = 4,
                  T:            int = 8,
                  tab_features: int = 28,
                  modes1:       int = 12,

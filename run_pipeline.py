@@ -30,60 +30,70 @@ def run_step(script_name, args=None):
     print(f"✅ COMPLETED: {script_name}")
 
 def main():
-    # --- PHASE 1: DATA & FEATURES ---
-    
+    # --- PHASE 1: DATA ACQUISITION ---
+
     # 1. Download raw TCND pillars (Data_1d, Data_3d, Env-Data)
     run_step("download_data.py")
 
-    # 2. Extract engineered features (Deltas, Δp, Shear, SST)
-    # This creates the CSV matrices used by all subsequent steps.
-    run_step("features_improved.py")
+    # --- PHASE 2: FEATURES (FIRST PASS) ---
 
-    # 3. Perform Ablation Study
-    # CRITICAL: This generates 'selected_feature_groups.json' which 
-    # 'train_ufno.py' requires for dynamic feature loading.
-    run_step("ablation.py")
+    # 2. First pass: build feature matrices without sp_* spatial scalars.
+    #    preprocess.py needs feature_matrix_landfall.csv to know which
+    #    (storm, ref_time) pairs to extract patches for.
+    run_step("features.py")
 
-    # 4. Generate interpretability rankings (SHAP/LIME)
-    # Provides visual evidence of feature importance before deep learning.
-    run_step("explain.py")
+    # --- PHASE 3: SPATIAL PREPROCESSING ---
 
-    # --- PHASE 2: DEEP LEARNING PREP & TRAINING ---
+    # 3. Extract 925 hPa patches from Data_3d NetCDF files.
+    #    Saves (8, 4, 81, 81) tensors to data/processed/3d/ and
+    #    data/processed/3d_landfall/. Requires feature_matrix_landfall.csv
+    #    (produced above) to know the landfall ref_times.
+    run_step("preprocess.py", ["--task", "all"])
 
-    # 5. Multimodal Preprocessing
-    # Converts CSVs and .nc files into synchronized tensors (.npy).
-    run_step("preprocess.py")
+    # --- PHASE 4: FEATURES (SECOND PASS) ---
 
-    # 6. Train Landfall Classification Model
-    # We train this first to get the 'best_ufno_landfall.pt' checkpoint.
-    #run_step("train_ufno.py", ["--task", "landfall", "--epochs", "50"])
+    # 4. Second pass: re-run features now that patches exist.
+    #    This adds sp_* scalar summaries (mean/std/max/p90/asymmetry per
+    #    channel) derived from the processed 3D patches.
+    run_step("features.py")
 
-    # 7. Train Intensity Decay Model with Landfall Embedding
-    # Uses the landfall model as a frozen feature extractor via FiLM.
-    # run_step("train_ufno.py", [
-    #     "--task", "decay", 
-    #     "--epochs", "60", 
-    #     "--landfall-ckpt", "models/best_ufno_landfall.pt"
-    # ])
+    # --- PHASE 5: FEATURE SELECTION ---
 
-    # --- PHASE 3: EVALUATION & GENERALIZATION ---
+    # 5. XGBoost ablation — ranks feature groups by R², writes
+    #    selected_feature_groups_{task}.json which train_ufno.py reads.
+    run_step("ablation.py", ["--task", "all"])
 
-    # 8. Generate Results Dashboard
-    # Produces scatter plots, decay curves, and MAE maps.
-    run_step("view_results.py")
+    # --- PHASE 6: TRAINING ---
 
-    # 9. Cross-Basin Generalization Experiment
-    # Tests if the U-FNO model can generalize across WP, NA, and EP.
-    #run_step("cross_basin.py", ["--epochs", "30"])
+    # 6. Train landfall timing model first (produces landfall embedding).
+    run_step("train_ufno.py", ["--task", "landfall", "--epochs", "100",
+                               "--lr", "3e-4", "--batch", "32"])
 
-    # 10. Log Experiment
-    # Records hyperparameters and RMSE to experiments/ for versioning.
+    # 7. Train intensity decay model with landfall embedding via FiLM.
+    run_step("train_ufno.py", ["--task", "decay", "--epochs", "150",
+                               "--lr", "3e-4", "--batch", "32",
+                               "--landfall-ckpt", "models/best_ufno_landfall.pt"])
+
+    # --- PHASE 7: EVALUATION ---
+
+    # 8. Generate results dashboards for both tasks.
+    run_step("view_results.py", ["--task", "landfall"])
+    run_step("view_results.py", ["--task", "decay"])
+
+    # 9. Cross-basin generalization (optional — comment out if not needed).
+    # run_step("cross_basin.py", ["--task", "landfall", "--epochs", "60"])
+    # run_step("cross_basin.py", ["--task", "decay",    "--epochs", "60"])
+
+    # 10. Feature importance (optional).
+    # run_step("explain.py")
+
+    # 11. Log experiment.
     run_step("log_experiment.py", [
-        "--name", "Full Pipeline Integration Run",
-        "--notes", "Standardized run of all modules with FiLM landfall injection."
+        "--name", "Full Pipeline Run",
+        "--notes", "Two-stage training: landfall timing then decay with FiLM embedding."
     ])
 
-    print("\n🎉 PIPELINE COMPLETE. Check 'figures/ufno_results/' for the dashboard.")
+    print("\nPIPELINE COMPLETE. Check 'figures/ufno_results/' for dashboards.")
 
 if __name__ == "__main__":
     main()

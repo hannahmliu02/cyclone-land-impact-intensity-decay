@@ -56,7 +56,11 @@ ALL_BASINS  = ["WP", "NA", "EP"]
 
 # Load TAB_COLS from ablation output (same as train_ufno.py)
 def _load_tab_cols():
-    sel_path = os.path.join(FEAT_DIR, "selected_feature_groups.json")
+    # Check task-specific file first, then fall back to shared file
+    candidates = [
+        os.path.join(FEAT_DIR, "selected_feature_groups_decay.json"),
+        os.path.join(FEAT_DIR, "selected_feature_groups.json"),
+    ]
     grp_path = os.path.join(FEAT_DIR, "feature_groups.json")
     fallback = [
         "wind_last","wind_max","wind_mean","wind_std",
@@ -65,7 +69,8 @@ def _load_tab_cols():
         "pres_delta_6h","pres_delta_12h","pres_delta_24h","pres_trend",
         "wp_residual",
     ]
-    if not os.path.exists(sel_path) or not os.path.exists(grp_path):
+    sel_path = next((p for p in candidates if os.path.exists(p)), None)
+    if sel_path is None or not os.path.exists(grp_path):
         return fallback
     with open(sel_path) as f:
         sel = json.load(f)
@@ -145,7 +150,7 @@ def make_loaders(df, train_basins, test_basins, seed, batch=8):
 def train_model(train_loader, val_loader, tab_dim, epochs, seed):
     torch.manual_seed(seed)
     model = CycloneUFNO(
-        sp_channels=5, T=8, tab_features=tab_dim,
+        sp_channels=4, T=8, tab_features=tab_dim,
         modes1=12, modes2=12, width=32, unet_dropout=0.2,
     ).to(DEVICE)
 

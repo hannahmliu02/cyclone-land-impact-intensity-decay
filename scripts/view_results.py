@@ -77,8 +77,8 @@ def load_model(ckpt_path: str):
     meta = ckpt["meta"]
 
     n_outputs    = 1 if meta.get("task") == "landfall" else 2
-    lf_embed_dim = args.get("lf_embed_dim", 0) or (
-        args.get("width", 32) if args.get("landfall_ckpt") else 0)
+    lf_key       = "stack.lf_film.0.net.0.weight"
+    lf_embed_dim = int(ckpt["state"][lf_key].shape[1]) if lf_key in ckpt["state"] else 0
     model = CycloneUFNO(
         sp_channels  = 4,
         T            = 8,
@@ -99,12 +99,15 @@ def load_model(ckpt_path: str):
 def predict(model, df: pd.DataFrame, meta: dict,
             tgt_mean, tgt_scale, tab_mean=None, tab_scale=None) -> pd.DataFrame:
     """Returns df with added columns: pred_24h, pred_48h, err_24h, err_48h."""
-    tab_cols  = [c for c in meta.get("tab_cols", TAB_COLS) if c in df.columns]
+    tab_cols   = meta.get("tab_cols", TAB_COLS)
     tab_scaler = StandardScaler()
 
-    # Fit scaler on full df (viewer uses all available data for display)
-    X_tab = tab_scaler.fit_transform(
-        df[tab_cols].values.astype(np.float32))
+    # Build X_tab with zero-fill for any columns missing from the current CSV
+    X_tab = np.zeros((len(df), len(tab_cols)), dtype=np.float32)
+    for j, col in enumerate(tab_cols):
+        if col in df.columns:
+            X_tab[:, j] = pd.to_numeric(df[col], errors="coerce").fillna(0).values
+    X_tab = tab_scaler.fit_transform(X_tab)
 
     preds = []
     with torch.no_grad():

@@ -38,17 +38,18 @@ Raw data: `data/raw/_tmp/Data1D/<basin>/<split>/`
 | Script | Purpose |
 |---|---|
 | `scripts/load_tcnd.py` | Shared TCND Data_1d loader |
-| `scripts/features.py` | Feature engineering from Data_1d |
-| `scripts/features_improved.py` | Extended features: Data_3d (pressure drop, wind shear, SST), Env-Data, improved land-sea |
-| `scripts/ablation.py` | Ablation study — ranks feature groups by R², writes `selected_feature_groups.json` |
-| `scripts/explain.py` | SHAP + LIME feature importance (optional) |
+| `scripts/download_data.py` | TCND data downloader (`--pillars`, `--basins` flags) |
+| `scripts/features.py` | Feature engineering — tabular (wind, pressure, position) + spatial scalar summaries + Env-Data aggregation |
+| `scripts/preprocess.py` | Extract 925 hPa patches from Data_3d; `--task {decay,landfall,all}`; `--zip` streaming mode |
+| `scripts/ablation.py` | XGBoost feature group ablation; writes `selected_feature_groups_{task}.json` |
 | `scripts/ufno.py` | CycloneUFNO model architecture |
-| `scripts/train_ufno.py` | Training — landfall and decay tasks |
-| `scripts/view_results.py` | 8-panel results dashboard |
-| `scripts/log_experiment.py` | Log experiment results to `experiments/` |
+| `scripts/train_ufno.py` | Training — landfall and decay tasks; `--basin`, `--no-spatial`, `--landfall-ckpt` flags |
+| `scripts/evaluate.py` | Standalone evaluation of a saved checkpoint |
+| `scripts/view_results.py` | Results dashboard; `--task {decay,landfall}` |
 | `scripts/cross_basin.py` | Cross-basin generalization experiments |
-| `scripts/download_data.py` | TCND data downloader |
-| `scripts/preprocess.py` | Preprocessing for spatial (Data_3d) mode |
+| `scripts/explain.py` | SHAP + LIME feature importance (optional) |
+| `scripts/log_experiment.py` | Log experiment results to `experiments/` |
+| `run_pipeline.py` | End-to-end pipeline orchestrator |
 
 ---
 
@@ -91,78 +92,98 @@ Features computed from the 48-hour track window before the reference time.
 
 **Selected groups (ablation-driven):** `wp_couple`, `wind`, `pressure` — 17 features total.
 
-`ablation.py` automatically updates `data/features/selected_feature_groups.json`, which `train_ufno.py` reads at startup.
+`ablation.py` automatically updates `data/features/selected_feature_groups_{task}.json` (one per task), which `train_ufno.py` reads at startup.
 
 ---
 
-## Usage
+## Pipeline
 
-### 1. Build features
+> **Important:** `features.py` must run twice — once before preprocessing (to create the CSVs that `preprocess.py` needs for landfall patch indices), and once after (to add `sp_*` spatial scalar summaries from the extracted patches).
+
+### Step 1. Download data
+```bash
+python scripts/download_data.py
+```
+
+### Step 2. First feature pass (no spatial scalars yet)
 ```bash
 python scripts/features.py
-# or, for extended 3D/env features:
-python scripts/features_improved.py
+```
+Creates `feature_matrix_landfall.csv` and `feature_matrix_decay.csv`. The `sp_*` columns will be empty at this stage — that is expected.
+
+### Step 3. Extract spatial patches
+```bash
+python scripts/preprocess.py --task all
+```
+Reads `feature_matrix_landfall.csv` to determine which (storm, ref_time) pairs to extract. Saves `(8, 4, 81, 81)` tensors to `data/processed/3d/` (decay) and `data/processed/3d_landfall/` (landfall).
+
+### Step 4. Second feature pass (adds sp_* scalars)
+```bash
+python scripts/features.py
+```
+Re-runs with patches now available. Adds `sp_*` mean/std/max/p90/asymmetry summaries per channel.
+
+### Step 5. Feature selection
+```bash
+python scripts/ablation.py --task all
+```
+XGBoost ablation over feature groups. Writes `selected_feature_groups_landfall.json` and `selected_feature_groups_decay.json`, which `train_ufno.py` reads at startup.
+
+### Step 6. Train — two-stage
+**Stage 1: landfall timing model**
+```bash
+python scripts/train_ufno.py --task landfall --epochs 100 --lr 3e-4 --batch 32
 ```
 
-### 2. Run ablation (auto-updates feature selection)
+**Stage 2: intensity decay model with landfall embedding**
 ```bash
-python scripts/ablation.py
-```
-
-### 3. Train — two-stage
-
-**Step 1: landfall model**
-```bash
-python scripts/train_ufno.py --task landfall --epochs 100
-```
-
-**Step 2: decay model with landfall embedding**
-```bash
-python scripts/train_ufno.py --task decay --epochs 150 \
+python scripts/train_ufno.py --task decay --epochs 150 --lr 3e-4 --batch 32 \
     --landfall-ckpt models/best_ufno_landfall.pt
 ```
 
 Or without landfall embedding:
 ```bash
-python scripts/train_ufno.py --task decay --epochs 150
+python scripts/train_ufno.py --task decay --epochs 150 --lr 3e-4 --batch 32
 ```
 
-Options:
+Key options:
 ```
---task          {landfall,decay}  Task to train             (default decay)
---landfall-ckpt PATH              Landfall checkpoint for embedding injection
---epochs        int               Training epochs           (default 100)
---batch         int               Batch size                (default 8)
---lr            float             Initial learning rate     (default 1e-3)
---modes         int               Fourier modes             (default 12)
---width         int               UFNO hidden width         (default 32)
---unet-dropout  float             UNet dropout              (default 0.2)
---seed          int               Random seed               (default 42)
+--task          {landfall,decay}  Task to train                    (default decay)
+--landfall-ckpt PATH              Landfall checkpoint for FiLM injection
+--no-spatial    flag              Force tabular-only mode (no image patches)
+--epochs        int               Training epochs                  (default 100)
+--batch         int               Batch size                       (default 8)
+--lr            float             Initial learning rate            (default 1e-3)
+--modes         int               Fourier modes                    (default 12)
+--width         int               UFNO hidden width                (default 32)
+--early-stop    int               Early stopping patience          (default 20)
+--seed          int               Random seed                      (default 42)
 ```
 
-### 4. View results
+### Step 7. View results
 ```bash
-python scripts/view_results.py --show
+python scripts/view_results.py --task landfall
+python scripts/view_results.py --task decay
 ```
-Saves an 8-panel dashboard to `figures/ufno_results/dashboard.png`.
+Saves dashboards to `figures/ufno_results/`.
 
-### 5. Log the experiment
+### Step 8. Cross-basin generalization (optional)
 ```bash
-python scripts/log_experiment.py \
-  --name "Two-stage: landfall embedding in decay model" \
-  --notes "What you observed"
+python scripts/cross_basin.py --task landfall --epochs 60
+python scripts/cross_basin.py --task decay   --epochs 60
 ```
 
-### 6. Feature importance (optional)
+### Step 9. Feature importance (optional)
 ```bash
 python scripts/explain.py
 ```
 
-### 7. Cross-basin generalization (optional)
+### Step 10. Log experiment
 ```bash
-python scripts/cross_basin.py --epochs 60
+python scripts/log_experiment.py \
+  --name "Two-stage: landfall + decay with FiLM embedding" \
+  --notes "What you observed"
 ```
-Produces transfer RMSE heatmap, gradual basin addition curves, and in-domain vs transfer comparison.
 
 ---
 
@@ -173,7 +194,8 @@ Produces transfer RMSE heatmap, gradual basin addition curves, and in-domain vs 
 | `data/features/feature_matrix_decay.csv` | 933 × 35 feature matrix — decay task |
 | `data/features/feature_matrix_landfall.csv` | 2389 × 30 feature matrix — landfall task |
 | `data/features/feature_groups.json` | Feature group definitions |
-| `data/features/selected_feature_groups.json` | Ablation-selected groups (auto-updated) |
+| `data/features/selected_feature_groups_decay.json` | Ablation-selected groups for decay (auto-updated) |
+| `data/features/selected_feature_groups_landfall.json` | Ablation-selected groups for landfall (auto-updated) |
 | `data/features/ablation_*.csv` | Ablation results per task |
 | `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
 | `models/best_ufno_landfall.pt` | Best landfall model checkpoint |
