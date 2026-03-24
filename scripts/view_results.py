@@ -76,7 +76,9 @@ def load_model(ckpt_path: str):
     args = ckpt["args"]
     meta = ckpt["meta"]
 
-    n_outputs = 1 if meta.get("task") == "landfall" else 2
+    n_outputs    = 1 if meta.get("task") == "landfall" else 2
+    lf_embed_dim = args.get("lf_embed_dim", 0) or (
+        args.get("width", 32) if args.get("landfall_ckpt") else 0)
     model = CycloneUFNO(
         sp_channels  = 4,
         T            = 8,
@@ -85,6 +87,8 @@ def load_model(ckpt_path: str):
         modes2       = args.get("modes", 12),
         width        = args.get("width", 32),
         unet_dropout = args.get("unet_dropout", 0.0),
+        n_outputs    = n_outputs,
+        lf_embed_dim = lf_embed_dim,
     ).to(DEVICE)
     model.load_state_dict(ckpt["state"])
     model.eval()

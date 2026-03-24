@@ -453,6 +453,14 @@ def load_data(seed: int, task: str = "decay", batch: int = 8,
 
 
 # ── Training / evaluation loops ───────────────────────────────────────────────
+def _pad_tab(x_tab: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Zero-pad x_tab along the feature dim to match target_dim."""
+    diff = target_dim - x_tab.shape[-1]
+    if diff <= 0:
+        return x_tab[:, :target_dim]
+    return torch.cat([x_tab, x_tab.new_zeros(x_tab.shape[0], diff)], dim=-1)
+
+
 def _forward(model, batch, mode: str, device, lf_model=None):
     """
     Run one forward pass.  lf_model: frozen landfall model for embedding injection.
@@ -464,7 +472,9 @@ def _forward(model, batch, mode: str, device, lf_model=None):
         lf_embed = None
         if lf_model is not None:
             with torch.no_grad():
-                lf_embed = lf_model.extract_embedding(x_tab=x_tab)
+                # Pad decay x_tab to landfall tab_dim so FiLM dims match
+                lf_tab = _pad_tab(x_tab, lf_model.tab_dim)
+                lf_embed = lf_model.extract_embedding(x_tab=lf_tab)
         pred = model(x_tab=x_tab, lf_embed=lf_embed)
     else:
         x3d, x_tab, y = batch
@@ -474,7 +484,9 @@ def _forward(model, batch, mode: str, device, lf_model=None):
         lf_embed = None
         if lf_model is not None:
             with torch.no_grad():
-                lf_embed = lf_model.extract_embedding(x_tab=x_tab, x_3d=x3d)
+                # Pad decay x_tab to landfall tab_dim so FiLM dims match
+                lf_tab = _pad_tab(x_tab, lf_model.tab_dim)
+                lf_embed = lf_model.extract_embedding(x_tab=lf_tab, x_3d=x3d)
         pred = model(x_3d=x3d, x_tab=x_tab, lf_embed=lf_embed)
     return pred, y
 
