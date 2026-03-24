@@ -305,17 +305,20 @@ def _run_spatial_modality_ablation(task: str, epochs: int = 20) -> dict | None:
         print(f"  [spatial modality] No patches found in {patch_dir} — skipping.")
         return None
 
-    script = os.path.join(os.path.dirname(__file__), "train_ufno.py")
+    script   = os.path.join(os.path.dirname(__file__), "train_ufno.py")
+    root_dir = os.path.join(os.path.dirname(__file__), "..")
+    # Save to a temp model name so production checkpoints are not overwritten
+    tmp_ckpt = f"ablation_spatial_tmp_{task}"
     base_cmd = [sys.executable, script, "--task", task,
                 "--epochs", str(epochs), "--early-stop", "10",
-                "--batch", "32", "--lr", "3e-4"]
+                "--batch", "32", "--lr", "3e-4",
+                "--save-name", tmp_ckpt]
 
     results = {}
     for mode, extra in [("tabular", ["--no-spatial"]), ("spatial", [])]:
         print(f"\n  [spatial modality — {task}/{mode}] training {epochs} epochs …")
         cmd = base_cmd + extra
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              cwd=os.path.join(os.path.dirname(__file__), ".."))
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=root_dir)
         # Parse best val loss from stdout
         best_val = None
         for line in proc.stdout.splitlines():

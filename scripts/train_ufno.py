@@ -551,6 +551,8 @@ def main():
                              "(0 = disabled)")
     parser.add_argument("--no-spatial",  action="store_true",
                         help="Force tabular-only mode even when 3D patches exist")
+    parser.add_argument("--save-name",   type=str, default=None,
+                        help="Override checkpoint filename stem (default: best_ufno_{task})")
     args = parser.parse_args()
 
     # Landfall defaults — use a smaller model unless overridden
@@ -630,7 +632,7 @@ def main():
     history       = {"train_loss": [], "val_loss": [], "train_mae": [], "val_mae": []}
     best_val      = float("inf")
     epochs_no_imp = 0
-    ckpt_name = f"best_ufno_{task}.pt"
+    ckpt_name = f"{args.save_name}.pt" if args.save_name else f"best_ufno_{task}.pt"
 
     header = (f"{'Epoch':>6}  {'Train':>8}  {'Val':>8}  "
               f"{'ValMAE':>8}  {'LR':>8}  {'Time':>6}  {'':>4}")
@@ -712,7 +714,8 @@ def main():
     model.load_state_dict(ckpt["state"])
     test_loss, test_mae = run_epoch(model, test_loader, mode, DEVICE,
                                     criterion=criterion, lf_model=lf_model)
-    print(f"\nTest loss  : {test_loss:.4f}")
+    print(f"\nBest val loss: {best_val:.4f}")
+    print(f"Test loss  : {test_loss:.4f}")
     print(f"Test MAE   : {test_mae:.4f}")
     if tgt_scaler is not None:
         scale = np.array(tgt_scaler.scale_)
