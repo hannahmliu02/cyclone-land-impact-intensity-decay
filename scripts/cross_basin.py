@@ -151,7 +151,7 @@ def train_model(train_loader, val_loader, tab_dim, epochs, seed, task="decay"):
     width = 16 if task == "landfall" else 32
     n_out = 1  if task == "landfall" else 2
     model = CycloneUFNO(
-        sp_channels=5, T=8, tab_features=tab_dim,
+        sp_channels=4, T=8, tab_features=tab_dim,
         modes1=modes, modes2=modes, width=width, unet_dropout=0.2,
         n_outputs=n_out,
     ).to(DEVICE)

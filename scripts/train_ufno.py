@@ -227,7 +227,7 @@ class TabularDecayDataset(Dataset):
                  fit: bool = False,
                  tab_cols: list = None):
         tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
-        X = df[tab_cols].values.astype(np.float32)
+        X = df[tab_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
         y = df[TARGET_COLS].values.astype(np.float32)
 
         if fit:
@@ -258,7 +258,7 @@ class SpatialDecayDataset(Dataset):
                  fit: bool = False,
                  tab_cols: list = None):
         tab_cols = [c for c in (tab_cols or TAB_COLS) if c in df.columns]
-        X_tab = df[tab_cols].values.astype(np.float32)
+        X_tab = df[tab_cols].replace("", np.nan).apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(np.float32)
         y     = df[TARGET_COLS].values.astype(np.float32)
 
         if fit:
@@ -584,7 +584,7 @@ def main():
         lf_args = lf_ckpt.get("args", {})
         lf_meta = lf_ckpt.get("meta", {})
         lf_model = CycloneUFNO(
-            sp_channels  = 5,
+            sp_channels  = 4,
             T            = 8,
             tab_features = lf_meta.get("tab_dim", meta["tab_dim"]),
             modes1       = lf_args.get("modes", 12),
@@ -604,7 +604,7 @@ def main():
     # ── Build model ────────────────────────────────────────────────────────
     n_outputs = 1 if task == "landfall" else 2
     model = CycloneUFNO(
-        sp_channels  = 5,
+        sp_channels  = 4,
         T            = 8,
         tab_features = meta["tab_dim"],
         modes1       = args.modes,
@@ -661,8 +661,6 @@ def main():
         if is_best:
             best_val      = vl_loss
             epochs_no_imp = 0
-        else:
-            epochs_no_imp += 1
             ckpt = {
                 "epoch":      epoch,
                 "state":      model.state_dict(),
@@ -676,6 +674,8 @@ def main():
                 ckpt["tab_mean"]  = tab_scaler.mean_.tolist()
                 ckpt["tab_scale"] = tab_scaler.scale_.tolist()
             torch.save(ckpt, os.path.join(MODELS_DIR, ckpt_name))
+        else:
+            epochs_no_imp += 1
 
         elapsed = time.time() - t0
         star    = "★" if is_best else " "

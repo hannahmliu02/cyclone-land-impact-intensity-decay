@@ -314,11 +314,32 @@ def _run_spatial_modality_ablation(task: str, epochs: int = 20) -> dict | None:
                 "--batch", "32", "--lr", "3e-4",
                 "--save-name", tmp_ckpt]
 
+    import tempfile
+
     results = {}
     for mode, extra in [("tabular", ["--no-spatial"]), ("spatial", [])]:
         print(f"\n  [spatial modality — {task}/{mode}] training {epochs} epochs …")
         cmd = base_cmd + extra
-        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=root_dir)
+        # Write to temp files instead of PIPE to capture output from C extensions (e.g. MPS)
+        out_fd, out_path = tempfile.mkstemp(suffix=".log")
+        err_fd, err_path = tempfile.mkstemp(suffix=".err")
+        try:
+            with os.fdopen(out_fd, "w") as out_f, os.fdopen(err_fd, "w") as err_f:
+                ret = subprocess.run(cmd, stdout=out_f, stderr=err_f, cwd=root_dir)
+            with open(out_path) as f:
+                out_text = f.read()
+            with open(err_path) as f:
+                err_text = f.read()
+        finally:
+            for p in (out_path, err_path):
+                try: os.unlink(p)
+                except OSError: pass
+
+        class _Proc:
+            returncode = ret.returncode
+            stdout = out_text
+            stderr = err_text
+        proc = _Proc()
         # Parse best val loss from stdout
         best_val = None
         for line in proc.stdout.splitlines():
@@ -328,8 +349,13 @@ def _run_spatial_modality_ablation(task: str, epochs: int = 20) -> dict | None:
                 except ValueError:
                     pass
         if best_val is None:
-            print(f"    [warn] Could not parse val loss from output.")
-            print(proc.stdout[-500:] if proc.stdout else proc.stderr[-500:])
+            print(f"    [warn] Could not parse val loss from output (returncode={proc.returncode}).")
+            if proc.stdout:
+                print("    -- stdout (last 800) --")
+                print(proc.stdout[-800:])
+            if proc.stderr:
+                print("    -- stderr (last 800) --")
+                print(proc.stderr[-800:])
         else:
             print(f"    Best val loss ({mode}): {best_val:.4f}")
         results[mode] = best_val
