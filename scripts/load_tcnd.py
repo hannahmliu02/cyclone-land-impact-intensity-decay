@@ -30,7 +30,7 @@ import pandas as pd
 
 # Root of the extracted TCND Data_1d tree
 _DATA1D_ROOT = os.path.join(
-    os.path.dirname(__file__), "..", "data", "raw", "_tmp", "Data1D"
+    os.path.dirname(__file__), "..", "data", "raw", "Data_1d", "GLOBAL", "Data1D"
 )
 
 # Sub-splits available in the dataset

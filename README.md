@@ -29,7 +29,7 @@ Each task has its own model. The decay model optionally ingests a learned embedd
 
 TCND original train/val/test splits are respected throughout — no random re-splitting — to prevent temporal leakage.
 
-Raw data: `data/raw/_tmp/Data1D/<basin>/<split>/`
+Raw data: `data/raw/Data_1d/GLOBAL/Data1D/<basin>/<split>/`
 
 ---
 
@@ -128,6 +128,11 @@ Re-runs with patches now available. Adds `sp_*` mean/std/max/p90/asymmetry summa
 python scripts/ablation.py --task all
 ```
 XGBoost ablation over feature groups. Writes `selected_feature_groups_landfall.json` and `selected_feature_groups_decay.json`, which `train_ufno.py` reads at startup.
+
+**Optional — spatial modality ablation** (not included in the end-to-end pipeline): trains the model twice per task (tabular-only vs. with spatial patches) to measure the contribution of 3D input:
+```bash
+python scripts/ablation.py --task all --spatial-modality --spatial-epochs 20
+```
 
 ### Step 6. Train — two-stage
 **Stage 1: landfall timing model**

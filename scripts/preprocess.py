@@ -11,7 +11,7 @@ in train_ufno.py.
 
 Directory layout expected
 ─────────────────────────
-data/raw/_tmp/Data3D/<BASIN>/<YEAR>/<STORM_NAME>/
+data/raw/Data_3d/<BASIN>/<YEAR>/<STORM_NAME>/
     TCND_<NAME>_<YYYYMMDDH0>_sst_z_u_v.nc
 
 Usage
@@ -79,9 +79,9 @@ def _fname_to_dt(fname: str) -> datetime | None:
 def _build_storm_dir_map(basin: str) -> dict[str, str]:
     """
     Returns {storm_id: abs_path_to_storm_dir} for every storm found under
-    data/raw/_tmp/Data3D/<BASIN>/
+    data/raw/Data_3d/<BASIN>/
     """
-    base = os.path.join(RAW_DIR, "_tmp", "Data3D", basin)
+    base = os.path.join(RAW_DIR, "Data_3d", basin)
     if not os.path.isdir(base):
         return {}
 

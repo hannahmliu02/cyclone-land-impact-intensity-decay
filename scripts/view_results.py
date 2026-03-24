@@ -320,18 +320,21 @@ def plot_error_hist(df: pd.DataFrame, ax24, ax48):
 
 def plot_spatial_errors(df: pd.DataFrame, ax):
     """Scatter of mean absolute error at each storm's landfall location."""
-    if "lat_last" not in df.columns or "lon_last" not in df.columns:
+    lon_col = "lon_last" if "lon_last" in df.columns else \
+              "lon_norm_last" if "lon_norm_last" in df.columns else None
+    if "lat_last" not in df.columns or lon_col is None:
         ax.text(0.5, 0.5, "Location data not available",
                 ha="center", va="center", transform=ax.transAxes)
         ax.set_title("Spatial Error Map")
         return
 
-    df_sp = df.dropna(subset=["lat_last", "lon_last"])
+    df_sp = df.dropna(subset=["lat_last", lon_col])
     mean_mae = (df_sp["mae_24h"] + df_sp["mae_48h"]) / 2
-    sc = ax.scatter(df_sp["lon_last"], df_sp["lat_last"],
+    sc = ax.scatter(df_sp[lon_col], df_sp["lat_last"],
                     c=mean_mae, cmap="YlOrRd", s=20, alpha=0.7)
     plt.colorbar(sc, ax=ax, label="Mean MAE (kt)")
-    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    xlabel = "Longitude" if lon_col == "lon_last" else "Longitude (normalised)"
+    ax.set_xlabel(xlabel); ax.set_ylabel("Latitude")
     ax.set_title("Mean |Error| at Landfall Location")
 
 

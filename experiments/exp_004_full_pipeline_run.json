@@ -1,0 +1,87 @@
+{
+  "id": "exp_004",
+  "name": "Full Pipeline Run",
+  "date": "2026-03-24",
+  "script": "scripts/train_ufno.py",
+  "description": "Full Pipeline Run",
+  "hyperparameters": {
+    "epochs": 150,
+    "batch": 8,
+    "lr": 0.001,
+    "modes": 12,
+    "width": 32,
+    "unet_dropout": 0.2,
+    "no_tab": false,
+    "seed": 42
+  },
+  "data": {
+    "basins": [
+      "WP",
+      "NA",
+      "EP"
+    ],
+    "split": "TCND original",
+    "n_train": 651,
+    "n_val": 188,
+    "n_test": 94,
+    "tab_cols": 17,
+    "tab_col_names": [
+      "wp_residual",
+      "wind_last",
+      "wind_max",
+      "wind_mean",
+      "wind_std",
+      "wind_delta_6h",
+      "wind_delta_12h",
+      "wind_delta_24h",
+      "wind_trend",
+      "pres_last",
+      "pres_min",
+      "pres_mean",
+      "pres_std",
+      "pres_delta_6h",
+      "pres_delta_12h",
+      "pres_delta_24h",
+      "pres_trend"
+    ]
+  },
+  "results": {
+    "best_epoch": 5,
+    "epochs_trained": 100,
+    "best_val_loss": 0.8994,
+    "best_val_epoch": 3,
+    "final_train_loss": 0.0286,
+    "final_val_loss": 7.5741,
+    "per_basin": {
+      "EP": {
+        "n": 114,
+        "rmse_24h": 0.0856,
+        "rmse_48h": 0.2947,
+        "mae_24h": 0.0594,
+        "mae_48h": 0.1984,
+        "bias_24h": -0.0088,
+        "bias_48h": 0.0488
+      },
+      "NA": {
+        "n": 214,
+        "rmse_24h": 0.0934,
+        "rmse_48h": 0.179,
+        "mae_24h": 0.0726,
+        "mae_48h": 0.1408,
+        "bias_24h": -0.0399,
+        "bias_48h": -0.0673
+      },
+      "WP": {
+        "n": 605,
+        "rmse_24h": 0.1313,
+        "rmse_48h": 0.2679,
+        "mae_24h": 0.0791,
+        "mae_48h": 0.1669,
+        "bias_24h": 0.0244,
+        "bias_48h": 0.0536
+      }
+    }
+  },
+  "observations": "Two-stage training: landfall timing then decay with FiLM embedding.",
+  "checkpoint": "models/best_ufno.pt (at time of logging)"
+}
