@@ -490,7 +490,7 @@ def run_epoch(model, loader, mode, device, optimizer=None, criterion=None,
 
             if training:
                 optimizer.zero_grad()
-                loss.backward()
+                loss.clamp(max=100.0).backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 

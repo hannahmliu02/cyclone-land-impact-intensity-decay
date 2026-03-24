@@ -376,7 +376,7 @@ class CycloneUFNO(nn.Module):
 
         # ── Global average pool → head ─────────────────────────────────
         pooled = field.mean(dim=(-2, -1))   # (B, width)
-        return self.head(pooled)             # (B, n_outputs)
+        return self.head(pooled).clamp(-10, 10)   # (B, n_outputs); clamp to ±10σ
 
     def extract_embedding(self,
                           x_tab: Optional[torch.Tensor] = None,
