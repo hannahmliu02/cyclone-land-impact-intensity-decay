@@ -13,27 +13,33 @@ import subprocess
 import sys
 import os
 
-def run_step(script_name, args=None):
+def run_step(script_name, args=None, allow_failure=False):
     """Helper to run a sub-script and check for errors."""
     cmd = [sys.executable, os.path.join("scripts", script_name)]
     if args:
         cmd.extend(args)
-    
+
     print(f"\n🚀 STARTING: {script_name}")
     print(f"命令: {' '.join(cmd)}")
-    
+
     result = subprocess.run(cmd)
-    
+
     if result.returncode != 0:
-        print(f"❌ ERROR: {script_name} failed. Halting pipeline.")
-        sys.exit(1)
-    print(f"✅ COMPLETED: {script_name}")
+        if allow_failure:
+            print(f"⚠️  WARNING: {script_name} exited with errors but pipeline continues.")
+        else:
+            print(f"❌ ERROR: {script_name} failed. Halting pipeline.")
+            sys.exit(1)
+    else:
+        print(f"✅ COMPLETED: {script_name}")
 
 def main():
     # --- PHASE 1: DATA ACQUISITION ---
 
     # 1. Download raw TCND pillars (Data_1d, Data_3d, Env-Data)
-    run_step("download_data.py")
+    # allow_failure=True because gdown may be interrupted by Google rate limits;
+    # the script retries automatically and proceeds with whatever was downloaded.
+    run_step("download_data.py", allow_failure=True)
 
     # --- PHASE 2: FEATURES (FIRST PASS) ---
 

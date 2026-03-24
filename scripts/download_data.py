@@ -55,7 +55,19 @@ def download():
         return
 
     print(f"Downloading TCND from Google Drive...\n{FOLDER_URL}\n")
-    gdown.download_folder(FOLDER_URL, output=TMP_DIR, quiet=False, remaining_ok=True)
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            gdown.download_folder(FOLDER_URL, output=TMP_DIR, quiet=False,
+                                  remaining_ok=True)
+            break  # success
+        except Exception as e:
+            print(f"\nDownload interrupted (attempt {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                print("Retrying — files already downloaded will be skipped by gdown...")
+            else:
+                print("Max retries reached. Proceeding with whatever was downloaded.")
+                print("If files are missing, re-run: python scripts/download_data.py")
 
 
 def extract():
