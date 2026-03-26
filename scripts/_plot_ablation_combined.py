@@ -57,46 +57,45 @@ def load_and_filter(fname):
 def plot_panel(ax, df, metric_col, err_col, title, ylabel, higher_is_better=False):
     baseline = df.loc[df["label"] == "full", metric_col].values[0]
 
-    # Green = KEEP (removing hurts performance), Red = DROP (removing helps)
-    colors = []
-    keep_flags = []
-    for lbl, val in zip(df["label"], df[metric_col]):
-        if lbl == "full":
-            colors.append("#457b9d")
-            keep_flags.append(None)
-        else:
-            hurts = val > baseline if not higher_is_better else val < baseline
-            colors.append("#2a9d8f" if hurts else "#e63946")
-            keep_flags.append(hurts)
+    # Plot delta from baseline (exclude the full row)
+    leave_out = df[df["label"] != "full"].copy()
+    # Delta: positive = removing hurt (for RMSE), or flipped for R²
+    if higher_is_better:
+        leave_out["delta"] = baseline - leave_out[metric_col]  # positive = hurts (R² dropped)
+    else:
+        leave_out["delta"] = leave_out[metric_col] - baseline  # positive = hurts (RMSE rose)
 
-    y = np.arange(len(df))
-    ax.barh(y, df[metric_col], xerr=df[err_col],
-            color=colors, edgecolor="white", height=0.65,
-            error_kw=dict(ecolor="#555", capsize=3, lw=1))
+    # Green = KEEP (delta > 0, removing hurts), Red = DROP (delta <= 0)
+    colors = ["#2a9d8f" if d > 0 else "#e63946" for d in leave_out["delta"]]
 
-    # Baseline reference line
-    ax.axvline(baseline, color="#457b9d", lw=1.2, linestyle="--", alpha=0.7)
+    y = np.arange(len(leave_out))
+    ax.barh(y, leave_out["delta"], color=colors, edgecolor="white", height=0.65)
+
+    ax.axvline(0, color="#457b9d", lw=1.2, linestyle="--", alpha=0.7)
 
     ax.set_yticks(y)
-    ax.set_yticklabels(df["display"], fontsize=9)
+    ax.set_yticklabels(leave_out["display"], fontsize=9)
     ax.invert_yaxis()
-    ax.set_xlabel(ylabel, fontsize=9)
+    ax.set_xlabel(f"Δ {ylabel} vs. all-features baseline\n(positive = removing this group hurts)", fontsize=9)
     ax.set_title(title, fontsize=10, fontweight="bold")
     ax.grid(axis="x", alpha=0.3)
 
-    x_max = (df[metric_col] + df[err_col]).max()
-    x_range = df[metric_col].max() - df[metric_col].min() or 0.01
+    x_range = leave_out["delta"].abs().max() or 0.01
+    pad = x_range * 0.05
+    for i, (delta, color) in enumerate(zip(leave_out["delta"], colors)):
+        if delta >= 0:
+            x_pos = delta + pad
+            ha = "left"
+        else:
+            x_pos = delta - pad
+            ha = "right"
+        ax.text(x_pos, i, f"{delta:+.4g}",
+                va="center", ha=ha, fontsize=8, fontweight="bold", color=color)
 
-    for i, (val, err, keep) in enumerate(zip(df[metric_col], df[err_col], keep_flags)):
-        # Value annotation
-        ax.text(x_max + x_range * 0.02, i, f"{val:.3f}", va="center", fontsize=8)
-        # KEEP / DROP badge
-        if keep is True:
-            ax.text(baseline - x_range * 0.02, i, "KEEP", va="center", ha="right",
-                    fontsize=7, fontweight="bold", color="#2a9d8f")
-        elif keep is False:
-            ax.text(baseline - x_range * 0.02, i, "DROP", va="center", ha="right",
-                    fontsize=7, fontweight="bold", color="#e63946")
+    # Expand x-axis so text labels have room and don't clip
+    x_min = leave_out["delta"].min()
+    x_max = leave_out["delta"].max()
+    ax.set_xlim(x_min - x_range * 0.35, x_max + x_range * 0.35)
 
 
 def main():

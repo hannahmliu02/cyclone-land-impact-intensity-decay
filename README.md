@@ -46,7 +46,7 @@ Raw data: `data/raw/Data_1d/GLOBAL/Data1D/<basin>/<split>/`
 | `scripts/train_ufno.py` | Training — landfall and decay tasks; `--basin`, `--no-spatial`, `--landfall-ckpt` flags |
 | `scripts/evaluate.py` | Standalone evaluation of a saved checkpoint |
 | `scripts/view_results.py` | Results dashboard; `--task {decay,landfall}` |
-| `scripts/cross_basin.py` | Cross-basin generalization experiments |
+| `scripts/cross_basin.py` | Cross-basin generalization experiments; `--task {decay,landfall,all}` |
 | `scripts/explain.py` | SHAP + LIME feature importance (optional) |
 | `scripts/log_experiment.py` | Log experiment results to `experiments/` |
 | `run_pipeline.py` | End-to-end pipeline orchestrator |
@@ -174,9 +174,14 @@ Saves dashboards to `figures/ufno_results/`.
 
 ### Step 8. Cross-basin generalization (optional)
 ```bash
+# Run one task
+python scripts/cross_basin.py --task decay    --epochs 60
 python scripts/cross_basin.py --task landfall --epochs 60
-python scripts/cross_basin.py --task decay   --epochs 60
+
+# Run both tasks sequentially
+python scripts/cross_basin.py --task all --epochs 60
 ```
+Outputs are task-specific: `cross_basin_results_{task}.csv`, `cross_basin_heatmap_{task}.png`, `cross_basin_gradual_{task}.png`, `cross_basin_summary_{task}.png`.
 
 ### Step 9. Feature importance (optional)
 ```bash
@@ -202,7 +207,8 @@ python scripts/log_experiment.py \
 | `data/features/selected_feature_groups_decay.json` | Ablation-selected groups for decay (auto-updated) |
 | `data/features/selected_feature_groups_landfall.json` | Ablation-selected groups for landfall (auto-updated) |
 | `data/features/ablation_*.csv` | Ablation results per task |
-| `data/features/cross_basin_results.csv` | Cross-basin experiment RMSE table |
+| `data/features/cross_basin_results_decay.csv` | Cross-basin experiment RMSE table — decay task |
+| `data/features/cross_basin_results_landfall.csv` | Cross-basin experiment RMSE table — landfall task |
 | `models/best_ufno_landfall.pt` | Best landfall model checkpoint |
 | `models/best_ufno_decay.pt` | Best decay model checkpoint |
 | `models/ufno_history.json` | Per-epoch loss and MAE log |
