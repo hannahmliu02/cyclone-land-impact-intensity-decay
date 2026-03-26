@@ -24,26 +24,15 @@ os.makedirs(FIG_DIR, exist_ok=True)
 KEEP_PREFIX = ("full", "leave_out_")
 
 GROUP_LABELS = {
-    "full":              "All features",
-    "leave_out_wind":    "− Wind",
-    "leave_out_pressure":"− Pressure",
+    "full":               "All features",
+    "leave_out_wind":     "− Wind",
+    "leave_out_pressure": "− Pressure",
     "leave_out_wp_couple":"− WP couple",
-    "leave_out_position":"− Position",
-    "leave_out_spatial": "− Spatial",
-    "leave_out_env":     "− Env-Data",
-    "leave_out_land_sea":"− Land/sea",
+    "leave_out_position": "− Position",
+    "leave_out_spatial":  "− Spatial",
+    "leave_out_env":      "− Env-Data",
+    "leave_out_land_sea": "− Land/sea",
 }
-
-# Color: red if removing this group hurts, grey for full baseline
-def bar_colors(labels, baseline_val, values, higher_is_better=False):
-    colors = []
-    for lbl, val in zip(labels, values):
-        if lbl == "full":
-            colors.append("#457b9d")
-        else:
-            worse = val > baseline_val if not higher_is_better else val < baseline_val
-            colors.append("#e63946" if worse else "#2a9d8f")
-    return colors
 
 
 def load_and_filter(fname):
@@ -54,25 +43,20 @@ def load_and_filter(fname):
     return df
 
 
-def plot_panel(ax, df, metric_col, err_col, title, ylabel, higher_is_better=False):
-    baseline = df.loc[df["label"] == "full", metric_col].values[0]
-
-    # Plot delta from baseline (exclude the full row)
+def plot_panel(ax, df, metric_col, err_col, title, ylabel, higher_is_better=False, baseline=None):
     leave_out = df[df["label"] != "full"].copy()
-    # Delta: positive = removing hurt (for RMSE), or flipped for R²
-    if higher_is_better:
-        leave_out["delta"] = baseline - leave_out[metric_col]  # positive = hurts (R² dropped)
-    else:
-        leave_out["delta"] = leave_out[metric_col] - baseline  # positive = hurts (RMSE rose)
 
-    # Green = KEEP (delta > 0, removing hurts), Red = DROP (delta <= 0)
+    if higher_is_better:
+        leave_out["delta"] = baseline - leave_out[metric_col]
+    else:
+        leave_out["delta"] = leave_out[metric_col] - baseline
+
     colors = ["#2a9d8f" if d > 0 else "#e63946" for d in leave_out["delta"]]
 
     y = np.arange(len(leave_out))
     ax.barh(y, leave_out["delta"], color=colors, edgecolor="white", height=0.65)
 
     ax.axvline(0, color="#457b9d", lw=1.2, linestyle="--", alpha=0.7)
-
     ax.set_yticks(y)
     ax.set_yticklabels(leave_out["display"], fontsize=9)
     ax.invert_yaxis()
@@ -83,50 +67,52 @@ def plot_panel(ax, df, metric_col, err_col, title, ylabel, higher_is_better=Fals
     x_range = leave_out["delta"].abs().max() or 0.01
     pad = x_range * 0.05
     for i, (delta, color) in enumerate(zip(leave_out["delta"], colors)):
-        if delta >= 0:
-            x_pos = delta + pad
-            ha = "left"
-        else:
-            x_pos = delta - pad
-            ha = "right"
+        x_pos = delta + pad if delta >= 0 else delta - pad
+        ha = "left" if delta >= 0 else "right"
         ax.text(x_pos, i, f"{delta:+.4g}",
                 va="center", ha=ha, fontsize=8, fontweight="bold", color=color)
 
-    # Expand x-axis so text labels have room and don't clip
     x_min = leave_out["delta"].min()
     x_max = leave_out["delta"].max()
     ax.set_xlim(x_min - x_range * 0.35, x_max + x_range * 0.35)
 
 
+def _baseline(fname, metric_col):
+    df = pd.read_csv(os.path.join(FEAT_DIR, fname))
+    return df.loc[df["label"] == "full", metric_col].values[0]
+
+
 def main():
     decay_24 = load_and_filter("ablation_decay_24h.csv")
     decay_48 = load_and_filter("ablation_decay_48h.csv")
-    landfall = load_and_filter("ablation_landfall.csv")
+    landfall  = load_and_filter("ablation_landfall.csv")
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle("Feature Group Ablation — All Tasks & Metrics",
                  fontsize=14, fontweight="bold", y=0.98)
 
     plot_panel(axes[0, 0], decay_24, "rmse_mean", "rmse_std",
-               "Decay — 24h RMSE", "RMSE (normalised wind)")
+               "Decay — 24h RMSE", "RMSE (normalised wind)",
+               baseline=_baseline("ablation_decay_24h.csv", "rmse_mean"))
 
     plot_panel(axes[0, 1], decay_48, "rmse_mean", "rmse_std",
-               "Decay — 48h RMSE", "RMSE (normalised wind)")
+               "Decay — 48h RMSE", "RMSE (normalised wind)",
+               baseline=_baseline("ablation_decay_48h.csv", "rmse_mean"))
 
     plot_panel(axes[1, 0], landfall, "r2_mean", "r2_std",
                "Landfall — R²", "R² (higher = better)",
-               higher_is_better=True)
+               higher_is_better=True,
+               baseline=_baseline("ablation_landfall.csv", "r2_mean"))
 
     plot_panel(axes[1, 1], landfall, "rmse_mean", "rmse_std",
-               "Landfall — Timing RMSE", "RMSE (hours to landfall)")
+               "Landfall — Timing RMSE", "RMSE (hours to landfall)",
+               baseline=_baseline("ablation_landfall.csv", "rmse_mean"))
 
-    # Shared legend
     legend_elements = [
-        mpatches.Patch(color="#457b9d", label="Baseline (all features)"),
-        mpatches.Patch(color="#2a9d8f", label="KEEP — removing this group hurts performance"),
-        mpatches.Patch(color="#e63946", label="DROP — removing this group helps or is neutral"),
+        mpatches.Patch(color="#2a9d8f", label="Removing hurts performance (important group)"),
+        mpatches.Patch(color="#e63946", label="Removing helps or is neutral (less important)"),
     ]
-    fig.legend(handles=legend_elements, loc="lower center", ncol=3,
+    fig.legend(handles=legend_elements, loc="lower center", ncol=2,
                fontsize=9, bbox_to_anchor=(0.5, 0.01))
 
     plt.tight_layout(rect=[0, 0.05, 1, 0.97])
