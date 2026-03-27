@@ -220,6 +220,20 @@ python scripts/log_experiment.py \
 
 ---
 
+## Experimental branch
+
+An experimental branch (`reducing-overfitting-experiment`) explores several improvements over the results presented in the main pipeline:
+
+- Real land-sea mask via `global-land-mask` + precomputed EDT distance grids
+- Env-data one-hot encoding collapsed to argmax scalars (~26 features vs ~300)
+- Future leakage keys stripped from env-data
+- 20×20 centre crop on 925 hPa spatial patches (reduces spatial input dimensionality)
+- Improved landfall detection via consecutive coastline crossing
+
+**Key finding:** the experimental branch significantly reduces the train/val overfitting gap for intensity decay at the cost of slightly worse raw RMSE (0.2 kt at 24h vs 0.1 kt in main).
+
+See the branch README for full details and reproduction instructions.
+
 ## Dependencies
 
 ```
