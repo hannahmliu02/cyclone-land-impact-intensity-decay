@@ -1,0 +1,42 @@
+{
+  "id": "exp_005",
+  "name": "v8: 20x20 crop, land-sea fix, delta-p, env argmax",
+  "date": "2026-03-27",
+  "script": "scripts/train_ufno.py",
+  "description": "v8: 20x20 crop, land-sea fix, delta-p, env argmax",
+  "hyperparameters": {},
+  "data": {},
+  "results": {
+    "per_basin": {
+      "EP": {
+        "n": 402,
+        "rmse_24h": 0.2251,
+        "rmse_48h": 0.3162,
+        "mae_24h": 0.1527,
+        "mae_48h": 0.2381,
+        "bias_24h": -0.0117,
+        "bias_48h": -0.0168
+      },
+      "NA": {
+        "n": 449,
+        "rmse_24h": 0.2004,
+        "rmse_48h": 0.3197,
+        "mae_24h": 0.1451,
+        "mae_48h": 0.242,
+        "bias_24h": -0.0429,
+        "bias_48h": -0.0595
+      },
+      "WP": {
+        "n": 1120,
+        "rmse_24h": 0.2331,
+        "rmse_48h": 0.377,
+        "mae_24h": 0.1524,
+        "mae_48h": 0.2708,
+        "bias_24h": 0.0283,
+        "bias_48h": 0.0741
+      }
+    }
+  },
+  "observations": "Spatial: 20x20 centre crop on 925 hPa patches (Gaussian mask disabled). Features: real land-sea mask (global-land-mask + EDT grids, signed dist). Features: pres_delta_from_landfall anchored to peak intensity. Features: env argmax encoding (~26 features, future keys stripped). Features: improved landfall detection via coastline crossing. Model: modes=6/8, width=12/16, early-stop=7, spatial-sigma=0.",
+  "checkpoint": "models/best_ufno.pt (at time of logging)"
+}

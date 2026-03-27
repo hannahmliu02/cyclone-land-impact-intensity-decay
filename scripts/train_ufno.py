@@ -45,6 +45,10 @@ Options
   --early-stop    int                Patience epochs          (default 20)
   --seed          int                Random seed              (default 42)
   --save-name     str                Override checkpoint stem
+  --noise-std     float              Gaussian noise std on tabular features
+                                     during training (default 0.0, try 0.02)
+  --spatial-sigma float              Gaussian centre mask sigma in pixels
+                                     (default 0.0 = off, try 10 for tight focus)
 
 Outputs (models/)
   best_ufno_{task}[_{basin}].pt    — best checkpoint (saved on every improvement)
@@ -180,8 +184,12 @@ class SpatialLandfallDataset(Dataset):
 
     def __getitem__(self, idx):
         npy = os.path.join(self.LF_PATCH_DIR, f"{self.keys[idx]}.npy")
-        x3d = torch.tensor(np.load(npy), dtype=torch.float32) \
-              if os.path.exists(npy) else None
+        if os.path.exists(npy):
+            patch = np.load(npy)
+            patch = patch[:, :, 30:50, 30:50]
+            x3d = torch.tensor(patch, dtype=torch.float32)
+        else:
+            x3d = None
         return x3d, self.X_tab[idx], self.y[idx]
 
 
@@ -218,8 +226,12 @@ class SpatialDecayDataset(Dataset):
 
     def __getitem__(self, idx):
         npy = os.path.join(PROC_DIR, "3d", f"{self.ids[idx]}.npy")
-        x3d = torch.tensor(np.load(npy), dtype=torch.float32) \
-              if os.path.exists(npy) else None
+        if os.path.exists(npy):
+            patch = np.load(npy)              # (T, C, 81, 81)
+            patch = patch[:, :, 30:50, 30:50] # centre 20x20 crop
+            x3d = torch.tensor(patch, dtype=torch.float32)
+        else:
+            x3d = None
         return x3d, self.X_tab[idx], self.y[idx]
 
 
@@ -389,10 +401,12 @@ def load_data(seed: int, task: str = "decay", batch: int = 8,
 
 # ── Forward pass ──────────────────────────────────────────────────────────────
 
-def _forward(model, batch, mode, device, lf_model=None):
+def _forward(model, batch, mode, device, lf_model=None, noise_std=0.0):
     if mode == "tabular":
         x_tab, y = batch
         x_tab = x_tab.to(device); y = y.to(device)
+        if noise_std > 0.0:
+            x_tab = x_tab + torch.randn_like(x_tab) * noise_std
         lf_embed = None
         if lf_model is not None:
             with torch.no_grad():
@@ -405,6 +419,8 @@ def _forward(model, batch, mode, device, lf_model=None):
         x3d, x_tab, y = batch
         x3d   = x3d.to(device) if x3d is not None else None
         x_tab = x_tab.to(device); y = y.to(device)
+        if noise_std > 0.0:
+            x_tab = x_tab + torch.randn_like(x_tab) * noise_std
         lf_embed = None
         if lf_model is not None:
             with torch.no_grad():
@@ -416,7 +432,7 @@ def _forward(model, batch, mode, device, lf_model=None):
 
 
 def run_epoch(model, loader, mode, device, optimizer=None, criterion=None,
-              desc="", show_bar=True, lf_model=None):
+              desc="", show_bar=True, lf_model=None, noise_std=0.0):
     from tqdm import tqdm
     if criterion is None:
         criterion = LpLoss(p=2)
@@ -432,7 +448,8 @@ def run_epoch(model, loader, mode, device, optimizer=None, criterion=None,
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for batch in bar:
-            pred, y = _forward(model, batch, mode, device, lf_model=lf_model)
+            pred, y = _forward(model, batch, mode, device, lf_model=lf_model,
+                               noise_std=noise_std if training else 0.0)
             loss = criterion(pred, y)
             if training:
                 optimizer.zero_grad()
@@ -485,6 +502,16 @@ def main():
     parser.add_argument("--early-stop",  type=int,   default=20)
     parser.add_argument("--seed",        type=int,   default=42)
     parser.add_argument("--save-name",   type=str,   default=None)
+    parser.add_argument("--noise-std",   type=float, default=0.0,
+                        help="Std of Gaussian noise added to tabular features "
+                             "during training only (0 = disabled). "
+                             "Features are StandardScaler-normalised so "
+                             "0.02 means ~2%% perturbation. Recommended: 0.01-0.05.")
+    parser.add_argument("--spatial-sigma", type=float, default=0.0,
+                        help="Std of Gaussian centre mask applied to spatial "
+                             "field (pixels, 0 = disabled). sigma=10 focuses "
+                             "on the inner ~2.5 deg storm core. No effect in "
+                             "tabular-only mode.")
     args = parser.parse_args()
 
     # Validate basin
@@ -494,7 +521,7 @@ def main():
             print(f"Error: --basin must be one of {sorted(VALID_BASINS)}")
             sys.exit(1)
 
-    # Landfall defaults
+    # Landfall defaults — smaller still since it's a simpler task
     if args.task == "landfall":
         if args.modes == 12: args.modes = 8
         if args.width == 32: args.width = 16
@@ -530,14 +557,15 @@ def main():
         lf_args  = lf_ckpt.get("args", {})
         lf_meta  = lf_ckpt.get("meta", {})
         lf_model = CycloneUFNO(
-            sp_channels  = 4,
-            T            = 8,
-            tab_features = lf_meta.get("tab_dim", meta["tab_dim"]),
-            modes1       = lf_args.get("modes", 8),
-            modes2       = lf_args.get("modes", 8),
-            width        = lf_args.get("width", 16),
-            unet_dropout = lf_args.get("unet_dropout", 0.0),
-            n_outputs    = 1,
+            sp_channels   = 4,
+            T             = 8,
+            tab_features  = lf_meta.get("tab_dim", meta["tab_dim"]),
+            modes1        = lf_args.get("modes", 8),
+            modes2        = lf_args.get("modes", 8),
+            width         = lf_args.get("width", 16),
+            unet_dropout  = lf_args.get("unet_dropout", 0.0),
+            n_outputs     = 1,
+            spatial_sigma = lf_args.get("spatial_sigma", 0.0),
         ).to(DEVICE)
         lf_model.load_state_dict(lf_ckpt["state"])
         lf_model.eval()
@@ -559,6 +587,7 @@ def main():
         unet_dropout = args.unet_dropout,
         n_outputs    = n_outputs,
         lf_embed_dim = lf_embed_dim,
+        spatial_sigma = args.spatial_sigma,
     ).to(DEVICE)
 
     print(f"\nTask       : {task}  |  Basin: {args.basin or 'all'}")
@@ -589,7 +618,8 @@ def main():
 
         tr_loss, tr_mae = run_epoch(
             model, train_loader, mode, DEVICE, optimizer, criterion,
-            desc=f"Ep {epoch:>3} train", show_bar=True, lf_model=lf_model)
+            desc=f"Ep {epoch:>3} train", show_bar=True, lf_model=lf_model,
+            noise_std=args.noise_std)
         vl_loss, vl_mae = run_epoch(
             model, val_loader, mode, DEVICE, criterion=criterion,
             desc=f"Ep {epoch:>3} val  ", show_bar=True, lf_model=lf_model)

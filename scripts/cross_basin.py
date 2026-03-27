@@ -12,16 +12,14 @@ on every basin's test split.
 
 Outputs
 ───────
-  data/features/cross_basin_results_{task}.csv     — full results table
-  figures/cross_basin_heatmap_{task}.png           — transfer RMSE heatmap
-  figures/cross_basin_gradual_{task}.png           — gradual addition curves
-  figures/cross_basin_summary_{task}.png           — bar chart comparison
+  data/features/cross_basin_results.csv   — full results table
+  figures/cross_basin_heatmap.png         — transfer RMSE heatmap
+  figures/cross_basin_gradual.png         — gradual addition curves
+  figures/cross_basin_summary.png         — bar chart comparison
 
 Usage
 ─────
-  python scripts/cross_basin.py --task decay   [--epochs 60] [--seed 42]
-  python scripts/cross_basin.py --task landfall [--epochs 60] [--seed 42]
-  python scripts/cross_basin.py --task all      [--epochs 60] [--seed 42]
+  python scripts/cross_basin.py [--epochs 60] [--seed 42]
 """
 
 import argparse
@@ -53,42 +51,14 @@ DEVICE = (torch.device("cuda")  if torch.cuda.is_available()  else
           torch.device("mps")   if torch.backends.mps.is_available() else
           torch.device("cpu"))
 
-ALL_BASINS = ["WP", "NA", "EP"]
+TARGET_COLS = ["wind_24h", "wind_48h"]
+ALL_BASINS  = ["WP", "NA", "EP"]
 
-TASK_CONFIG = {
-    "decay": {
-        "csv":         "feature_matrix_decay.csv",
-        "target_cols": ["wind_24h", "wind_48h"],
-        "sel_json":    "selected_feature_groups_decay.json",
-        "metric_cols": ["rmse_24h", "rmse_48h"],
-        "metric_labels": ["RMSE 24h (normalised wind)", "RMSE 48h (normalised wind)"],
-        "heatmap_col": "rmse_24h",
-        "heatmap_label": "RMSE (normalised wind, 24h)",
-        "summary_col": "rmse_24h",
-        "summary_label": "RMSE (normalised wind, 24h)",
-    },
-    "landfall": {
-        "csv":         "feature_matrix_landfall.csv",
-        "target_cols": ["hours_to_landfall"],
-        "sel_json":    "selected_feature_groups_landfall.json",
-        "metric_cols": ["rmse_hours"],
-        "metric_labels": ["RMSE (hours to landfall)"],
-        "heatmap_col": "rmse_hours",
-        "heatmap_label": "RMSE (hours to landfall)",
-        "summary_col": "rmse_hours",
-        "summary_label": "RMSE (hours to landfall)",
-    },
-}
-
-# ── Per-task globals (set in run_task) ────────────────────────────────────────
-TARGET_COLS = None
-TAB_COLS    = None
-CFG         = None
-
-
-def _load_tab_cols(task):
+# Load TAB_COLS from ablation output (same as train_ufno.py)
+def _load_tab_cols():
+    # Check task-specific file first, then fall back to shared file
     candidates = [
-        os.path.join(FEAT_DIR, TASK_CONFIG[task]["sel_json"]),
+        os.path.join(FEAT_DIR, "selected_feature_groups_decay.json"),
         os.path.join(FEAT_DIR, "selected_feature_groups.json"),
     ]
     grp_path = os.path.join(FEAT_DIR, "feature_groups.json")
@@ -111,13 +81,14 @@ def _load_tab_cols(task):
         cols.extend(groups.get(g, []))
     return list(dict.fromkeys(cols)) or fallback
 
+TAB_COLS = _load_tab_cols()
+
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 class TabularDataset(Dataset):
     def __init__(self, df, tab_scaler, tgt_scaler, fit=False):
         tab_cols = [c for c in TAB_COLS if c in df.columns]
-        X_df = df[tab_cols].apply(pd.to_numeric, errors="coerce")
-        X = X_df.fillna(X_df.median()).fillna(0.0).values.astype(np.float32)
+        X = df[tab_cols].fillna(df[tab_cols].median()).values.astype(np.float32)
         y = df[TARGET_COLS].values.astype(np.float32)
         self.X = torch.tensor(tab_scaler.fit_transform(X) if fit
                               else tab_scaler.transform(X), dtype=torch.float32)
@@ -130,14 +101,19 @@ class TabularDataset(Dataset):
 
 # ── Build loaders for a given train/val/test basin split ──────────────────────
 def make_loaders(df, train_basins, test_basins, seed, batch=8):
-    global TAB_COLS
+    """
+    train_basins  — list of basin names used for training (TCND train split)
+    test_basins   — list of basin names evaluated at test time (TCND test split)
+    """
+    # Always validate on the training basins' val split
     train_df = df[df["basin"].isin(train_basins) & (df["split"] == "train")
                   ].dropna(subset=TARGET_COLS).reset_index(drop=True)
     val_df   = df[df["basin"].isin(train_basins) & (df["split"] == "val")
                   ].dropna(subset=TARGET_COLS).reset_index(drop=True)
 
+    # Test separately for each target basin
     test_dfs = {
-        b: df[(df["basin"] == b) & (df["split"] == "test")]
+        b: df[df["basin"] == b][df["split"] == "test"]
                .dropna(subset=TARGET_COLS).reset_index(drop=True)
         for b in test_basins
     }
@@ -146,21 +122,14 @@ def make_loaders(df, train_basins, test_basins, seed, batch=8):
         raise ValueError(f"Too few training samples ({len(train_df)}) "
                          f"for basins {train_basins}")
 
-    # Drop zero-variance columns computed on training data — they carry no
-    # information and cause unscaled large values on out-of-distribution test data.
-    tab_cols_active = [c for c in TAB_COLS if c in train_df.columns]
-    X_check = train_df[tab_cols_active].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    nonzero_var = X_check.columns[X_check.var() > 1e-8].tolist()
-    _orig_tab_cols = TAB_COLS
-    TAB_COLS = nonzero_var
-
     tab_scaler = StandardScaler()
     tgt_scaler = StandardScaler()
 
     train_ds = TabularDataset(train_df, tab_scaler, tgt_scaler, fit=True)
     val_ds   = TabularDataset(val_df,   tab_scaler, tgt_scaler, fit=False)
 
-    counts  = train_df["basin"].value_counts().to_dict()
+    # Inverse-frequency basin sampler
+    counts = train_df["basin"].value_counts().to_dict()
     weights = train_df["basin"].map(lambda b: 1.0 / counts.get(b, 1)).values
     sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
 
@@ -172,9 +141,8 @@ def make_loaders(df, train_basins, test_basins, seed, batch=8):
         for b, tdf in test_dfs.items() if len(tdf) > 0
     }
 
-    tab_cols = [c for c in TAB_COLS if c in train_df.columns]
+    tab_cols = [c for c in TAB_COLS if c in df.columns]
     meta = {"tab_dim": len(tab_cols), "tgt_scaler": tgt_scaler}
-    TAB_COLS = _orig_tab_cols  # restore for next call
     return train_loader, val_loader, test_loaders, meta
 
 
@@ -184,7 +152,6 @@ def train_model(train_loader, val_loader, tab_dim, epochs, seed):
     model = CycloneUFNO(
         sp_channels=4, T=8, tab_features=tab_dim,
         modes1=12, modes2=12, width=32, unet_dropout=0.2,
-        n_outputs=len(TARGET_COLS),
     ).to(DEVICE)
 
     criterion = LpLoss(p=2)
@@ -192,7 +159,7 @@ def train_model(train_loader, val_loader, tab_dim, epochs, seed):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5)
 
-    best_val   = float("inf")
+    best_val  = float("inf")
     best_state = None
 
     for epoch in range(1, epochs + 1):
@@ -200,8 +167,7 @@ def train_model(train_loader, val_loader, tab_dim, epochs, seed):
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             loss = criterion(model(x_tab=x), y)
-            optimizer.zero_grad()
-            loss.clamp(max=100.0).backward()
+            optimizer.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -213,21 +179,17 @@ def train_model(train_loader, val_loader, tab_dim, epochs, seed):
                 val_loss += criterion(model(x_tab=x), y).item() * y.size(0)
                 n += y.size(0)
         val_loss /= max(n, 1)
-        if not np.isfinite(val_loss):
-            continue
         scheduler.step(val_loss)
 
         if val_loss < best_val:
             best_val   = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-    if best_state is None:
-        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     return model, best_val
 
 
-# ── Evaluate on a loader ───────────────────────────────────────────────────────
+# ── Evaluate on a loader, return RMSE per horizon ─────────────────────────────
 def evaluate(model, loader, tgt_scaler):
     model.eval()
     preds, targets = [], []
@@ -238,26 +200,29 @@ def evaluate(model, loader, tgt_scaler):
     preds   = np.vstack(preds)
     targets = np.vstack(targets)
 
+    # Denormalise
     preds_p   = tgt_scaler.inverse_transform(preds)
     targets_p = tgt_scaler.inverse_transform(targets)
 
     rmse = np.sqrt(((preds_p - targets_p) ** 2).mean(axis=0))
     mae  = np.abs(preds_p - targets_p).mean(axis=0)
-
-    result = {"n": len(preds)}
-    for i, col in enumerate(CFG["metric_cols"]):
-        result[col]                      = rmse[i]
-        result[col.replace("rmse", "mae")] = mae[i]
-    return result
+    return {"rmse_24h": rmse[0], "rmse_48h": rmse[1],
+            "mae_24h":  mae[0],  "mae_48h":  mae[1],
+            "n": len(preds)}
 
 
 # ── Experiment runners ─────────────────────────────────────────────────────────
-def run_single_and_cross(df, epochs, seed, task):
+def run_single_and_cross(df, epochs, seed):
+    """
+    For each training basin, train a model and test on all basins.
+    Returns a DataFrame with columns: train_basins, test_basin, rmse_24h, ...
+    """
     rows = []
     for train_b in ALL_BASINS:
         print(f"\n  Training on [{train_b}]...")
         try:
-            tl, vl, test_loaders, meta = make_loaders(df, [train_b], ALL_BASINS, seed)
+            tl, vl, test_loaders, meta = make_loaders(
+                df, [train_b], ALL_BASINS, seed)
         except ValueError as e:
             print(f"    Skipped: {e}"); continue
 
@@ -268,23 +233,29 @@ def run_single_and_cross(df, epochs, seed, task):
         for test_b, loader in test_loaders.items():
             m = evaluate(model, loader, tgt_scaler)
             rows.append({"train_basins": train_b, "test_basin": test_b, **m})
-            metrics_str = "  ".join(f"{k}={v:.3f}" for k, v in m.items() if k != "n")
-            print(f"    → test [{test_b}]  {metrics_str}  n={m['n']}")
+            print(f"    → test [{test_b}]  RMSE_24h={m['rmse_24h']:.3f}  "
+                  f"RMSE_48h={m['rmse_48h']:.3f}  n={m['n']}")
 
-        ckpt_path = os.path.join(MODELS_DIR, f"train_{train_b}_{task}.pt")
+        # Save checkpoint
+        ckpt_path = os.path.join(MODELS_DIR, f"train_{train_b}.pt")
         torch.save(model.state_dict(), ckpt_path)
 
     return pd.DataFrame(rows)
 
 
 def run_gradual(df, epochs, seed):
+    """
+    Train on WP → WP+NA → WP+NA+EP, test on all basins each time.
+    Returns a DataFrame.
+    """
     configs = [["WP"], ["WP", "NA"], ["WP", "NA", "EP"]]
     rows = []
     for train_basins in configs:
         label = "+".join(train_basins)
         print(f"\n  Gradual — training on [{label}]...")
         try:
-            tl, vl, test_loaders, meta = make_loaders(df, train_basins, ALL_BASINS, seed)
+            tl, vl, test_loaders, meta = make_loaders(
+                df, train_basins, ALL_BASINS, seed)
         except ValueError as e:
             print(f"    Skipped: {e}"); continue
 
@@ -295,26 +266,27 @@ def run_gradual(df, epochs, seed):
         for test_b, loader in test_loaders.items():
             m = evaluate(model, loader, tgt_scaler)
             rows.append({"train_basins": label, "test_basin": test_b, **m})
-            metrics_str = "  ".join(f"{k}={v:.3f}" for k, v in m.items() if k != "n")
-            print(f"    → test [{test_b}]  {metrics_str}  n={m['n']}")
+            print(f"    → test [{test_b}]  RMSE_24h={m['rmse_24h']:.3f}  "
+                  f"RMSE_48h={m['rmse_48h']:.3f}  n={m['n']}")
 
     return pd.DataFrame(rows)
 
 
 # ── Plotting ───────────────────────────────────────────────────────────────────
-def plot_heatmap(cross_df, task):
+def plot_heatmap(cross_df):
+    """RMSE_24h heatmap: rows = train basin, cols = test basin."""
     single = cross_df[~cross_df["train_basins"].str.contains(r"\+")]
-    col    = CFG["heatmap_col"]
     pivot  = single.pivot(index="train_basins", columns="test_basin",
-                          values=col).reindex(index=ALL_BASINS, columns=ALL_BASINS)
+                          values="rmse_24h").reindex(
+                              index=ALL_BASINS, columns=ALL_BASINS)
 
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(pivot.values, cmap="YlOrRd", aspect="auto")
-    plt.colorbar(im, ax=ax, label=CFG["heatmap_label"])
+    plt.colorbar(im, ax=ax, label="RMSE (normalised wind, 24h)")
     ax.set_xticks(range(len(ALL_BASINS))); ax.set_xticklabels(ALL_BASINS)
     ax.set_yticks(range(len(ALL_BASINS))); ax.set_yticklabels(ALL_BASINS)
     ax.set_xlabel("Test basin"); ax.set_ylabel("Train basin")
-    ax.set_title(f"Cross-basin Transfer — {task.capitalize()}\n"
+    ax.set_title("Cross-basin Transfer RMSE (24h)\n"
                  "Diagonal = in-domain, off-diagonal = transfer")
 
     for i in range(len(ALL_BASINS)):
@@ -326,134 +298,126 @@ def plot_heatmap(cross_df, task):
                         fontsize=10)
 
     plt.tight_layout()
-    path = os.path.join(FIG_DIR, f"cross_basin_heatmap_{task}.png")
+    path = os.path.join(FIG_DIR, "cross_basin_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"\n  Saved: {path}")
 
 
-def plot_gradual(gradual_df, task):
+def plot_gradual(gradual_df):
+    """Line chart: as more basins are added, how does each test basin RMSE change?"""
     configs = gradual_df["train_basins"].unique().tolist()
-    metrics = CFG["metric_cols"]
-    labels  = CFG["metric_labels"]
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 4), sharey=False)
-    if len(metrics) == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
     colors = {"WP": "#1f78b4", "NA": "#33a02c", "EP": "#e31a1c"}
 
-    for ax, metric, label in zip(axes, metrics, labels):
+    for ax, metric, label in zip(axes,
+                                  ["rmse_24h", "rmse_48h"],
+                                  ["RMSE 24h", "RMSE 48h"]):
         for test_b in ALL_BASINS:
-            sub  = gradual_df[gradual_df["test_basin"] == test_b]
-            vals = [sub[sub["train_basins"] == c][metric].values for c in configs]
+            sub = gradual_df[gradual_df["test_basin"] == test_b]
+            vals = [sub[sub["train_basins"] == c][metric].values
+                    for c in configs]
             vals = [v[0] if len(v) else np.nan for v in vals]
             ax.plot(configs, vals, marker="o",
                     label=f"Test: {test_b}", color=colors.get(test_b, "#888"))
         ax.set_title(f"Gradual Basin Addition — {label}")
         ax.set_xlabel("Training basins")
-        ax.set_ylabel(label)
-        ax.legend(); ax.grid(alpha=0.3)
+        ax.set_ylabel("RMSE (normalised)")
+        ax.legend()
+        ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    path = os.path.join(FIG_DIR, f"cross_basin_gradual_{task}.png")
+    path = os.path.join(FIG_DIR, "cross_basin_gradual.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"  Saved: {path}")
 
 
-def plot_summary(cross_df, gradual_df, task):
-    col = CFG["summary_col"]
+def plot_summary(cross_df, gradual_df):
+    """Bar chart: in-domain vs best cross-basin RMSE for each test basin."""
     fig, ax = plt.subplots(figsize=(8, 4))
     x = np.arange(len(ALL_BASINS))
     w = 0.25
 
+    # In-domain: train == test
     in_domain = []
     for b in ALL_BASINS:
-        row = cross_df[(cross_df["train_basins"] == b) & (cross_df["test_basin"] == b)]
-        in_domain.append(row[col].values[0] if len(row) else np.nan)
+        row = cross_df[(cross_df["train_basins"] == b) &
+                       (cross_df["test_basin"] == b)]
+        in_domain.append(row["rmse_24h"].values[0] if len(row) else np.nan)
 
+    # Best single-basin transfer (train != test, lowest RMSE)
     best_transfer = []
     for b in ALL_BASINS:
         others = cross_df[(cross_df["train_basins"] != b) &
                           (~cross_df["train_basins"].str.contains(r"\+")) &
                           (cross_df["test_basin"] == b)]
-        best_transfer.append(others[col].min() if len(others) else np.nan)
+        best_transfer.append(others["rmse_24h"].min() if len(others) else np.nan)
 
+    # All-basin model
     all_basin = []
     for b in ALL_BASINS:
         row = gradual_df[(gradual_df["train_basins"] == "WP+NA+EP") &
                          (gradual_df["test_basin"] == b)]
-        all_basin.append(row[col].values[0] if len(row) else np.nan)
+        all_basin.append(row["rmse_24h"].values[0] if len(row) else np.nan)
 
-    ax.bar(x - w, in_domain,     w, label="In-domain",            color="#457B9D")
-    ax.bar(x,     best_transfer, w, label="Best transfer",         color="#E63946")
-    ax.bar(x + w, all_basin,     w, label="All-basin (WP+NA+EP)", color="#2A9D8F")
+    ax.bar(x - w, in_domain,    w, label="In-domain",         color="#457B9D")
+    ax.bar(x,     best_transfer, w, label="Best transfer",     color="#E63946")
+    ax.bar(x + w, all_basin,    w, label="All-basin (WP+NA+EP)", color="#2A9D8F")
 
     ax.set_xticks(x); ax.set_xticklabels(ALL_BASINS)
-    ax.set_ylabel(CFG["summary_label"])
-    ax.set_title(f"In-domain vs Cross-basin vs All-basin — {task.capitalize()}")
+    ax.set_ylabel("RMSE (normalised wind, 24h)")
+    ax.set_title("In-domain vs Cross-basin vs All-basin Performance")
     ax.legend(); ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(FIG_DIR, f"cross_basin_summary_{task}.png")
+    path = os.path.join(FIG_DIR, "cross_basin_summary.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"  Saved: {path}")
-
-
-# ── Per-task runner ────────────────────────────────────────────────────────────
-def run_task(task, epochs, seed):
-    global TARGET_COLS, TAB_COLS, CFG
-    CFG         = TASK_CONFIG[task]
-    TARGET_COLS = CFG["target_cols"]
-    TAB_COLS    = _load_tab_cols(task)
-
-    print(f"\n{'='*60}")
-    print(f"Task: {task.upper()}")
-    print(f"{'='*60}")
-
-    csv_path = os.path.join(FEAT_DIR, CFG["csv"])
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Run features.py first — missing {CFG['csv']}")
-
-    df = pd.read_csv(csv_path, keep_default_na=False)
-    df = df[df["basin"].isin(ALL_BASINS)].dropna(subset=TARGET_COLS)
-    for col in TARGET_COLS:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=TARGET_COLS)
-
-    print(f"Basin counts: {df['basin'].value_counts().to_dict()}")
-    print(f"Split counts: {df['split'].value_counts().to_dict()}")
-
-    print("\nExperiment 1 & 2: Single-basin training + cross-basin transfer")
-    cross_df = run_single_and_cross(df, epochs, seed, task)
-
-    print("\nExperiment 3: Gradual basin addition")
-    gradual_df = run_gradual(df, epochs, seed)
-
-    all_results = pd.concat([cross_df, gradual_df], ignore_index=True)
-    out_path = os.path.join(FEAT_DIR, f"cross_basin_results_{task}.csv")
-    all_results.to_csv(out_path, index=False)
-    print(f"\nResults saved: {out_path}")
-
-    print("\nGenerating plots...")
-    plot_heatmap(cross_df, task)
-    plot_gradual(gradual_df, task)
-    plot_summary(cross_df, gradual_df, task)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task",   choices=["decay", "landfall", "all"],
-                        default="decay",
-                        help="Which task to run (default: decay)")
     parser.add_argument("--epochs", type=int, default=60,
                         help="Epochs per experiment (default 60)")
     parser.add_argument("--seed",   type=int, default=42)
     args = parser.parse_args()
 
-    print(f"Device: {DEVICE}  |  Epochs: {args.epochs}  |  Seed: {args.seed}")
+    print(f"Device: {DEVICE}")
+    print(f"Epochs per run: {args.epochs}")
 
-    tasks = ["decay", "landfall"] if args.task == "all" else [args.task]
-    for task in tasks:
-        run_task(task, args.epochs, args.seed)
+    decay_csv = os.path.join(FEAT_DIR, "feature_matrix_decay.csv")
+    if not os.path.exists(decay_csv):
+        raise FileNotFoundError("Run features.py first.")
+
+    df = pd.read_csv(decay_csv, keep_default_na=False)
+    df = df[df["basin"].isin(ALL_BASINS)].dropna(subset=TARGET_COLS)
+
+    print(f"\nBasin counts: {df['basin'].value_counts().to_dict()}")
+    print(f"Split counts: {df['split'].value_counts().to_dict()}")
+
+    # ── Experiment 1 & 2: single-basin train + cross-basin test ───────────────
+    print("\n" + "="*60)
+    print("Experiment 1 & 2: Single-basin training + cross-basin transfer")
+    print("="*60)
+    cross_df = run_single_and_cross(df, args.epochs, args.seed)
+
+    # ── Experiment 3: gradual basin addition ──────────────────────────────────
+    print("\n" + "="*60)
+    print("Experiment 3: Gradual basin addition")
+    print("="*60)
+    gradual_df = run_gradual(df, args.epochs, args.seed)
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    all_results = pd.concat([cross_df, gradual_df], ignore_index=True)
+    out_path = os.path.join(FEAT_DIR, "cross_basin_results.csv")
+    all_results.to_csv(out_path, index=False)
+    print(f"\nResults saved: {out_path}")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\nGenerating plots...")
+    plot_heatmap(cross_df)
+    plot_gradual(gradual_df)
+    plot_summary(cross_df, gradual_df)
 
     print("\nCross-basin experiments complete.")
     print(f"Figures: {FIG_DIR}/cross_basin_*.png")

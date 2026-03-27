@@ -283,6 +283,10 @@ class CycloneUFNO(nn.Module):
     unet_dropout  : dropout inside UNet2d branches       (default 0.0)
     n_outputs     : 1 for landfall classification, 2 for decay regression
     lf_embed_dim  : dim of landfall embedding for decay model (0 = disabled)
+    spatial_sigma : std of Gaussian centre mask in pixels (0 = disabled).
+                    Applied to the projected spatial field before the UFNO
+                    stack.  sigma=10 focuses on the inner ~2.5 deg core.
+                    No effect in tabular-only mode.
 
     Forward inputs
     --------------
@@ -311,7 +315,8 @@ class CycloneUFNO(nn.Module):
                  pad_size:     int = 4,
                  unet_dropout: float = 0.0,
                  n_outputs:    int = 2,
-                 lf_embed_dim: int = 0):
+                 lf_embed_dim: int = 0,
+                 spatial_sigma: float = 0.0):
         super().__init__()
 
         self.T           = T
@@ -321,6 +326,25 @@ class CycloneUFNO(nn.Module):
         self.tab_dim     = tab_features
         self.n_outputs   = n_outputs
         self.lf_embed_dim = lf_embed_dim
+        self.spatial_sigma = spatial_sigma
+
+        # ── Gaussian centre mask ───────────────────────────────────
+        # Precompute a (1, 1, H, W) Gaussian centred on pixel (40, 40),
+        # the storm centre in the 81x81 TCND patches.  Registered as a
+        # buffer so it moves to the correct device automatically and is
+        # saved in checkpoints.  sigma=0 disables the mask entirely.
+        if spatial_sigma > 0.0:
+            cx, cy = 40, 40   # storm centre in 81x81 patch
+            ys = torch.arange(81, dtype=torch.float32)
+            xs = torch.arange(81, dtype=torch.float32)
+            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+            mask = torch.exp(
+                -((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * spatial_sigma ** 2)
+            )  # (81, 81), peak=1 at centre
+            self.register_buffer('_spatial_mask',
+                                 mask.unsqueeze(0).unsqueeze(0))  # (1,1,81,81)
+        else:
+            self._spatial_mask = None
 
         # ── Input projections ──────────────────────────────────────────
         sp_in = T * sp_channels
@@ -362,7 +386,12 @@ class CycloneUFNO(nn.Module):
             B, T, C, H, W = x_3d.shape
             field = x_3d.permute(0, 3, 4, 1, 2).reshape(B, H, W, T * C)
             field = self.input_proj_sp(field)
-            field = field.permute(0, 3, 1, 2)
+            field = field.permute(0, 3, 1, 2)   # (B, width, H, W)
+            # Apply Gaussian centre mask: upweight storm core, downweight
+            # periphery.  Mask is (1,1,H,W) — broadcasts over B and width.
+            # Only applied when x_3d is present; tabular-only is unaffected.
+            if self._spatial_mask is not None:
+                field = field * self._spatial_mask
         else:
             B = x_tab.shape[0]
             G = self.grid_size
@@ -392,6 +421,8 @@ class CycloneUFNO(nn.Module):
             B, T, C, H, W = x_3d.shape
             field = x_3d.permute(0, 3, 4, 1, 2).reshape(B, H, W, T * C)
             field = self.input_proj_sp(field).permute(0, 3, 1, 2)
+            if self._spatial_mask is not None:
+                field = field * self._spatial_mask
         else:
             B = x_tab.shape[0]
             G = self.grid_size

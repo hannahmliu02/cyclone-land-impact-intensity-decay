@@ -1,17 +1,18 @@
 """
-TCND Master Pipeline Orchestrator
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Automates the full workflow:
-1. Data Acquisition
-2. Feature Engineering & Selection
-3. Multimodal Preprocessing
-4. Model Training (Landfall -> Intensity)
-5. Evaluation & Logging
+TCND Experiment Pipeline
+━━━━━━━━━━━━━━━━━━━━━━━━
+Changes from run_pipeline.py:
+  - 20x20 centre crop on spatial patches (spatial-sigma disabled)
+  - Improved landfall detection via land-sea mask (features_improved.py)
+  - env argmax encoding, future key stripping, pres_delta_from_landfall
+  - Reduced model capacity (modes=6/8, width=12/16) + early-stop=7
+  - No cross-basin, no model size sweep, no explain.py
 """
 
 import subprocess
 import sys
 import os
+
 
 def run_step(script_name, args=None, allow_failure=False):
     """Helper to run a sub-script and check for errors."""
@@ -19,87 +20,111 @@ def run_step(script_name, args=None, allow_failure=False):
     if args:
         cmd.extend(args)
 
-    print(f"\n🚀 STARTING: {script_name}")
-    print(f"命令: {' '.join(cmd)}")
+    print(f"\nSTARTING: {script_name}")
+    print(f"   cmd: {' '.join(cmd)}")
 
     result = subprocess.run(cmd)
 
     if result.returncode != 0:
         if allow_failure:
-            print(f"⚠️  WARNING: {script_name} exited with errors but pipeline continues.")
+            print(f"WARNING: {script_name} exited with errors but pipeline continues.")
         else:
-            print(f"❌ ERROR: {script_name} failed. Halting pipeline.")
+            print(f"ERROR: {script_name} failed. Halting pipeline.")
             sys.exit(1)
     else:
-        print(f"✅ COMPLETED: {script_name}")
+        print(f"COMPLETED: {script_name}")
+
 
 def main():
-    # --- PHASE 1: DATA ACQUISITION ---
 
-    # 1. Download raw TCND pillars (Data_1d, Data_3d, Env-Data)
-    # allow_failure=True because gdown may be interrupted by Google rate limits;
-    # the script retries automatically and proceeds with whatever was downloaded.
+    # --- PHASE 1: DATA ACQUISITION ---
     run_step("download_data.py", allow_failure=True)
 
-    # --- PHASE 2: FEATURES (FIRST PASS) ---
+    # --- PHASE 2: LAND GRID PRECOMPUTATION (one-time, ~2-3 min) ---
+    proc_dir = os.path.join("data", "processed")
+    grids_exist = (
+        os.path.exists(os.path.join(proc_dir, "dist_to_coast_025.npy")) and
+        os.path.exists(os.path.join(proc_dir, "dist_inland_025.npy"))
+    )
+    if grids_exist:
+        print("\n SKIPPING: build_land_grids.py (grids already present)")
+    else:
+        run_step("build_land_grids.py")
 
-    # 2. First pass: build feature matrices without sp_* spatial scalars.
-    #    preprocess.py needs feature_matrix_landfall.csv to know which
-    #    (storm, ref_time) pairs to extract patches for.
-    run_step("features.py")
+    # --- PHASE 3: FEATURES (FIRST PASS) ---
+    # features_improved.py includes:
+    #   - Real land-sea mask via global-land-mask + EDT grids
+    #   - env argmax encoding (~26 features vs ~300)
+    #   - future_* keys stripped (no label leakage)
+    #   - pres_delta_from_landfall for decay task
+    #   - Improved landfall detection via coastline crossing
+    run_step("features_improved.py")
 
-    # --- PHASE 3: SPATIAL PREPROCESSING ---
-
-    # 3. Extract 925 hPa patches from Data_3d NetCDF files.
-    #    Saves (8, 4, 81, 81) tensors to data/processed/3d/ and
-    #    data/processed/3d_landfall/. Requires feature_matrix_landfall.csv
-    #    (produced above) to know the landfall ref_times.
+    # --- PHASE 4: SPATIAL PREPROCESSING ---
+    # Extracts 925 hPa patches (8, 4, 81, 81) to data/processed/3d/
+    # and data/processed/3d_landfall/.
+    # Note: patches are saved at full 81x81 resolution.
+    # The 20x20 centre crop is applied at training time in the dataset
+    # __getitem__ methods in train_ufno.py.
     run_step("preprocess.py", ["--task", "all"])
 
-    # --- PHASE 4: FEATURES (SECOND PASS) ---
+    # --- PHASE 5: FEATURES (SECOND PASS) ---
+    # Re-run now patches exist to add sp_* scalar summaries.
+    run_step("features_improved.py")
 
-    # 4. Second pass: re-run features now that patches exist.
-    #    This adds sp_* scalar summaries (mean/std/max/p90/asymmetry per
-    #    channel) derived from the processed 3D patches.
-    run_step("features.py")
-
-    # --- PHASE 5: FEATURE SELECTION ---
-
-    # 5. XGBoost ablation — ranks feature groups by R², writes
-    #    selected_feature_groups_{task}.json which train_ufno.py reads.
+    # --- PHASE 6: FEATURE SELECTION ---
     run_step("ablation.py", ["--task", "all"])
 
-    # --- PHASE 6: TRAINING ---
+    # --- PHASE 7: TRAINING ---
 
-    # 6. Train landfall timing model first (produces landfall embedding).
-    run_step("train_ufno.py", ["--task", "landfall", "--epochs", "100",
-                               "--lr", "3e-4", "--batch", "32"])
+    # Stage 1: Landfall timing model.
+    # spatial-sigma=0 — Gaussian mask disabled, using 20x20 crop instead.
+    # modes=6, width=12 — small capacity appropriate for landfall task.
+    run_step("train_ufno.py", [
+        "--task",          "landfall",
+        "--epochs",        "100",
+        "--lr",            "3e-4",
+        "--batch",         "32",
+        "--modes",         "6",
+        "--width",         "12",
+        "--early-stop",    "7",
+        "--spatial-sigma", "0",
+    ])
 
-    # 7. Train intensity decay model with landfall embedding via FiLM.
-    run_step("train_ufno.py", ["--task", "decay", "--epochs", "150",
-                               "--lr", "3e-4", "--batch", "32",
-                               "--landfall-ckpt", "models/best_ufno_landfall.pt"])
+    # Stage 2: Intensity decay model with landfall embedding via FiLM.
+    # spatial-sigma=0 — Gaussian mask disabled, using 20x20 crop instead.
+    # modes=8, width=16 — slightly larger capacity for harder regression task.
+    run_step("train_ufno.py", [
+        "--task",          "decay",
+        "--epochs",        "150",
+        "--lr",            "3e-4",
+        "--batch",         "32",
+        "--modes",         "8",
+        "--width",         "16",
+        "--early-stop",    "7",
+        "--spatial-sigma", "0",
+        "--landfall-ckpt", "models/best_ufno_landfall.pt",
+    ])
 
-    # --- PHASE 7: EVALUATION ---
-
-    # 8. Generate results dashboards for both tasks.
+    # --- PHASE 8: EVALUATION ---
     run_step("view_results.py", ["--task", "landfall"])
     run_step("view_results.py", ["--task", "decay"])
 
-    # 9. Cross-basin generalization (optional — comment out if not needed).
-    # run_step("cross_basin.py", ["--task", "landfall", "--epochs", "60"])
-    # run_step("cross_basin.py", ["--task", "decay",    "--epochs", "60"])
-
-    # 10. Feature importance (optional).
-    # run_step("explain.py")
-
-    # 11. Log experiment.
+    # --- PHASE 9: EXPERIMENT LOGGING ---
     run_step("log_experiment.py", [
-        "--name", "Full Pipeline Run",
-        "--notes", "Two-stage training: landfall timing then decay with FiLM embedding."
+        "--name",  "v8: 20x20 crop, land-sea fix, delta-p, env argmax",
+        "--notes", (
+            "Spatial: 20x20 centre crop on 925 hPa patches (Gaussian mask disabled). "
+            "Features: real land-sea mask (global-land-mask + EDT grids, signed dist). "
+            "Features: pres_delta_from_landfall anchored to peak intensity. "
+            "Features: env argmax encoding (~26 features, future keys stripped). "
+            "Features: improved landfall detection via coastline crossing. "
+            "Model: modes=6/8, width=12/16, early-stop=7, spatial-sigma=0."
+        ),
     ])
 
     print("\nPIPELINE COMPLETE. Check 'figures/ufno_results/' for dashboards.")
+
 
 if __name__ == "__main__":
     main()
