@@ -47,6 +47,7 @@ Raw data: `data/raw/Data_1d/GLOBAL/Data1D/<basin>/<split>/`
 | `scripts/evaluate.py` | Standalone evaluation of a saved checkpoint |
 | `scripts/view_results.py` | Results dashboard; `--task {decay,landfall}` |
 | `scripts/cross_basin.py` | Cross-basin generalization experiments; `--task {decay,landfall,all}` |
+| `scripts/model_size_sweep.py` | Model capacity sweep across widths [8, 12, 16, 24, 32] |
 | `scripts/explain.py` | SHAP + LIME feature importance (optional) |
 | `scripts/log_experiment.py` | Log experiment results to `experiments/` |
 | `run_pipeline.py` | End-to-end pipeline orchestrator |
@@ -183,9 +184,9 @@ python scripts/cross_basin.py --task all --epochs 60
 ```
 Outputs are task-specific: `cross_basin_results_{task}.csv`, `cross_basin_heatmap_{task}.png`, `cross_basin_gradual_{task}.png`, `cross_basin_summary_{task}.png`.
 
-### Step 9. Feature importance (optional)
+### Step 9. Model size sweep (optional)
 ```bash
-python scripts/explain.py
+python scripts/model_size_sweep.py --epochs 50 --early-stop 12 --batch 32 --lr 3e-4 --widths 8 12 16 24 32
 ```
 
 ### Step 10. Log experiment
